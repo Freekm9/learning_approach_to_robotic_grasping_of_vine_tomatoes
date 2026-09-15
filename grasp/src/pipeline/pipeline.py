@@ -29,6 +29,7 @@ class Idle(smach.State):
                              input_keys=['success', 'prev_command', 'truss_data', 'map', 'grasp_candidates', 'grasp_pose'],
                              output_keys=['command', 'prev_command', 'truss_data', 'map', 'grasp_candidates', 'grasp_pose'])
 
+        
         self.node_name = NODE_NAME
         self.rqt_service = rospy.Service('rqt_service', pipeline_command, self.set_next_state)
         self.next_state = None
@@ -117,6 +118,7 @@ class Idle(smach.State):
             return 'grasp_pose_from_candidates'
         else:
             return 'failure'
+       
 class DetectObjectOBB(smach.State):
     def __init__(self):
         smach.State.__init__(self, outcomes=['success', 'failure'], 
@@ -344,8 +346,70 @@ class MoveRobot(smach.State):
             userdata.success = False
             return 'failure'
         
+class DetectObjectManual(smach.State):
+    def __init__(self):
+        smach.State.__init__(self, outcomes=['success', 'failure'], 
+                             input_keys=['command'], 
+                             output_keys=['success', 'prev_command', 'truss_data'])
+        try:
+            rospy.wait_for_service('detect_truss_manual', timeout=30)
+            self.detect_truss_obb_service = rospy.ServiceProxy('detect_truss_manual', detect_truss_command)
+        except:
+            print("detect_truss_manual FAILED")
 
+    def execute(self, userdata):
+        rospy.logdebug('Executing state Detect Manual')
         
+        # command node
+        if userdata.command == 'detect_truss_manual':
+            try:
+                truss_data = self.detect_truss_obb_service('detect_truss_manual').poses
+            except:
+                print("PIPELINE FAILED TO RETREIVE TRUSS DATA")
+                userdata.success = False
+                return 'failure'
+            userdata.truss_data = truss_data
+            userdata.prev_command = userdata.command
+            userdata.success = True
+            return 'success'
+        userdata.success = False
+        return 'failure'
+        '''
+class SimplePickPoint(smach.State):
+    def __init__(self):
+        smach.State.__init__(self, outcomes=['success', 'failure'], 
+                             input_keys=['command'], 
+                             output_keys=['success', 'prev_command', 'truss_data'])
+        try:
+            rospy.wait_for_service('simple_pick_point', timeout=30)
+            self.detect_truss_obb_service = rospy.ServiceProxy('simple_pick_point', detect_truss_command)
+        except:
+            print("detect_truss_manual FAILED")
+
+    def execute(self, userdata):
+        rospy.logdebug('Executing state Detect Manual')
+        
+        # command node
+        if userdata.command == 'detect_truss_manual':
+            try:
+                truss_data = self.detect_truss_obb_service('detect_truss_manual').poses
+            except:
+                print("PIPELINE FAILED TO RETREIVE TRUSS DATA")
+                userdata.success = False
+                return 'failure'
+            userdata.truss_data = truss_data
+            userdata.prev_command = userdata.command
+            userdata.success = True
+            return 'success'
+        userdata.success = False
+        return 'failure'
+        try:
+            rospy.wait_for_service('move_robot', timeout=30)
+            self.move_robot_service = rospy.ServiceProxy('move_robot', pipeline_command)
+        except:
+            print("move_robot_services FAILED")
+'''
+
 #MAIN
 def main():
     rospy.init_node('pipeline',anonymous=True)
@@ -359,6 +423,7 @@ def main():
     # Open the container
     with sm:
         # Add states to the container
+        
         smach.StateMachine.add('Idle', Idle(),
                                transitions={'detect_obb':'DetectObjectOBB',
                                             'detect_manual':'DetectObjectManual',
@@ -367,7 +432,7 @@ def main():
                                             'grasp_candidates_manual':'DetermineGraspCandidatesManual',
                                             'grasp_candidates_oriented_keypoint':'DetermineGraspCandidatesOrientedKeypoint',
                                             'grasp_pose_from_candidates':'ChooseGraspPoseFromCandidates',
-                                            'failure': 'Idle'})
+                                            'failure': 'Idle'})                
         smach.StateMachine.add('DetectObjectOBB', DetectObjectOBB(),
                                transitions={'success': 'Idle',
                                             'failure': 'Idle',})
@@ -389,7 +454,11 @@ def main():
         smach.StateMachine.add('MoveRobot', MoveRobot(),
                                transitions={'success':'Idle',
                                             'failure': 'Idle'})
-                                           
+        '''
+        smach.StateMachine.add('SimplePickPoint', SimplePickPoint(),
+                               transitions={'success': 'Idle',
+                                            'failure': 'Idle',})                                    
+'''                                           
 
     # Execute SMACH plan
     sm.userdata.prev_command = None

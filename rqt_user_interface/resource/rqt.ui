@@ -7255,6 +7255,20 @@
      </property>
     </widget>
    </item>
+   <item row="16" column="3">
+    <widget class="QPushButton" name="SimplePickPoint">
+     <property name="text">
+      <string>SimplePickPoint</string>
+     </property>
+    </widget>
+   </item>
+   <item row="16" column="4">
+    <widget class="QPushButton" name="TestPreGraspPositions">
+     <property name="text">
+      <string>TestPreGraspPositions</string>
+     </property>
+    </widget>
+   </item>
   </layout>
  </widget>
  <resources/>

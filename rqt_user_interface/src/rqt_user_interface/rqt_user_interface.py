@@ -68,7 +68,35 @@ class RqtPipeline(Plugin):
         self._widget.ExecuteFullPipelineCOM.clicked[bool].connect(lambda: self.send_command_to_pipeline("execute_full_pipeline_COM"))
         self._widget.ExecuteFullPipelineCrateCOM.clicked[bool].connect(lambda: self.send_command_to_pipeline("execute_full_pipeline_crate_COM"))
         self._widget.ToggleExecuteFullPipelineRepeat.clicked[bool].connect(lambda: self.send_command_to_pipeline("toggle_execute_full_pipeline_repeat"))
-    
+        self._widget.SimplePickPoint.clicked[bool].connect(self.trigger_simple_pick_point)
+        self._widget.TestPreGraspPositions.clicked[bool].connect(self.trigger_test_pre_grasp_positions)
+
+        self.simple_pick_point_service = None
+        self.test_pre_grasp_positions_service = None
+
+    def trigger_simple_pick_point(self):
+        # Bypasses the pipeline/smach dispatch: this service does the whole
+        # click-to-grasp action itself (image, click, set_grasp_pose, move_robot).
+        if self.simple_pick_point_service is None:
+            rospy.wait_for_service('simple_pick_point', timeout=10)
+            self.simple_pick_point_service = rospy.ServiceProxy('simple_pick_point', pipeline_command)
+        try:
+            self.simple_pick_point_service("simple_pick_point")
+        except rospy.ServiceException as exc:
+            print("Service did not process request: " + str(exc))
+
+    def trigger_test_pre_grasp_positions(self):
+        # Same click-to-pick UI as Simple Pick Point, but instead of grasping it steps
+        # the arm through each reachable pre-grasp orientation for the picked point so
+        # gripper alignment on the truss can be checked before committing to a real pick.
+        if self.test_pre_grasp_positions_service is None:
+            rospy.wait_for_service('test_pre_grasp_positions', timeout=10)
+            self.test_pre_grasp_positions_service = rospy.ServiceProxy('test_pre_grasp_positions', pipeline_command)
+        try:
+            self.test_pre_grasp_positions_service("test_pre_grasp_positions")
+        except rospy.ServiceException as exc:
+            print("Service did not process request: " + str(exc))
+
     def send_command_to_pipeline(self, command):
         if self.pipeline == None:
             rospy.wait_for_service('rqt_service', timeout=10)

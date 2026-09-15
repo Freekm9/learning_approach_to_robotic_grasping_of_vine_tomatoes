@@ -48,3 +48,7 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+# Trained model weights - too large for git (best.pt files exceed/near GitHub's
+# 100MB hard limit). See WEIGHTS.md for what's excluded and how to get them.
+**/weights/

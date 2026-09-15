@@ -1,0 +1,91 @@
+<?xml version="1.0"?>
+<!--
+  Gazebo simulation launch for the tomato truss grasping pipeline.
+
+  What runs:
+    - Gazebo with panda arm + extended fingers + a bin world
+    - MoveIt (simulation mode, via panda_moveit_config_vine_tomato)
+    - plan_movement_node  (robot mover)
+    - determine_grasp_candidates_manual  (annotation-based grasps)
+    - determine_grasp_candidates_oriented_keypoint  (vision-based, needs camera)
+    - choose_grasp_pose_from_candidates
+    - pipeline state machine
+    - rqt GUI
+
+  What does NOT run:
+    - RealSense camera driver (no real camera in sim)
+    - pointcloud node (no camera)
+
+  For testing grasps without vision: use the rqt GUI to call
+  `determine_grasp_candidates_manual` after pointing the camera above the bin
+  (or skip to `grasp` directly by calling `set_grasp_pose` from a script).
+  For full vision testing: add a simulated depth camera to the URDF.
+-->
+<launch>
+  <arg name="robot_name"    default="panda"/>
+  <arg name="camera_frame"  default="camera_color_optical_frame"/>
+  <arg name="headless"      default="false"/>
+  <arg name="world"         default="$(find grasp)/worlds/tomato_bin.world"/>
+  <arg name="gui_start_delay" default="12"/>
+
+  <!-- Global ROS params (same as vine_grasping.launch) -->
+  <param name="robot_name"    type="str" value="$(arg robot_name)"/>
+  <param name="camera_frame"  type="str" value="$(arg camera_frame)"/>
+  <param name="planning_frame" type="str" value="$(arg robot_name)_link0"/>
+
+  <!-- 1. Start Gazebo with panda (includes robot_description, controllers, MoveIt) -->
+  <include file="$(find franka_gazebo)/launch/panda.launch">
+    <arg name="gazebo"   value="true"/>
+    <arg name="headless" value="$(arg headless)"/>
+    <arg name="world"    value="$(arg world)"/>
+    <arg name="rviz"     value="true"/>
+    <!-- Pass updated TCP length via xacro arg -->
+    <arg name="xacro_args" value="tcp_xyz:='0 0 0.1934'"/>
+    <!-- Start robot in a neutral downward-facing pose -->
+    <arg name="initial_joint_positions"
+         value="-J $(arg robot_name)_joint1 0
+                -J $(arg robot_name)_joint2 -0.785398163
+                -J $(arg robot_name)_joint3 0
+                -J $(arg robot_name)_joint4 -2.35619449
+                -J $(arg robot_name)_joint5 0
+                -J $(arg robot_name)_joint6 1.57079632679
+                -J $(arg robot_name)_joint7 0.785398163397
+                -J $(arg robot_name)_finger_joint1 0.04
+                -J $(arg robot_name)_finger_joint2 0.04"/>
+  </include>
+
+  <!-- 2. Grasp pipeline nodes (in robot namespace, same as real robot launch) -->
+  <group ns="$(arg robot_name)">
+
+    <node name="plan_movement"
+          pkg="grasp" type="plan_movement_node.py" output="screen"/>
+
+    <node name="determine_grasp_candidates_oriented_keypoint"
+          pkg="grasp" type="determine_grasp_candidates_oriented_keypoint_node.py"
+          output="screen"/>
+
+    <node name="determine_grasp_candidates_manual"
+          pkg="grasp" type="determine_grasp_candidates_manual_node.py"
+          output="screen"/>
+
+    <node name="choose_grasp_pose_from_candidates"
+          pkg="grasp" type="choose_grasp_pose_from_candidates_node.py"
+          output="screen"/>
+
+    <node name="pipeline"
+          pkg="grasp" type="pipeline.py" output="screen"/>
+
+    <node name="rqt"
+          pkg="rqt_user_interface" type="rqt_user_interface" output="screen"
+          launch-prefix="bash -c 'sleep $(arg gui_start_delay); $0 $@'"/>
+
+    <!-- Fake F_ext publisher so plan_movement doesn't block waiting for force data.
+         Publishes zero wrench on the expected topic. -->
+    <node name="fake_fext_pub" pkg="rostopic" type="rostopic"
+          args="pub -r 10 franka_state_controller/F_ext geometry_msgs/WrenchStamped
+                '{header: {frame_id: panda_link0}, wrench: {force: {x: 0, y: 0, z: 0}}}'
+          " output="screen"/>
+
+  </group>
+
+</launch>

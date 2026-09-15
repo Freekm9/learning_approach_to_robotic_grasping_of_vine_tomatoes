@@ -34,7 +34,9 @@
     <node name="determine_grasp_candidates_oriented_keypoint" pkg="grasp" type="determine_grasp_candidates_oriented_keypoint_node.py" output="screen"></node>
     
     <node name="determine_grasp_candidates_manual" pkg="grasp" type="determine_grasp_candidates_manual_node.py" output="screen"></node>
-    
+
+    <node name="simple_pick_point" pkg="grasp" type="simple_pick_point_node.py" output="screen"></node>
+
     <node name="choose_grasp_pose_from_candidates" pkg="grasp" type="choose_grasp_pose_from_candidates_node.py" output="screen"></node>
   
     <node name="pipeline" pkg="grasp" type="pipeline.py" output="screen"></node>

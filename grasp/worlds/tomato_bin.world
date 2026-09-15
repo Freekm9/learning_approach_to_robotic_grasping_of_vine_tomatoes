@@ -1,0 +1,103 @@
+<?xml version="1.0" ?>
+<sdf version="1.6">
+  <world name="tomato_bin_world">
+    <include>
+      <uri>model://ground_plane</uri>
+    </include>
+    <include>
+      <uri>model://sun</uri>
+    </include>
+
+    <!-- Bin: four walls and a floor, positioned in front of the robot -->
+    <!-- Bin floor -->
+    <model name="bin_floor">
+      <static>true</static>
+      <pose>0.5 0 0.1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.5 0.4 0.02</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.5 0.4 0.02</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Bin front wall (x+) -->
+    <model name="bin_wall_front">
+      <static>true</static>
+      <pose>0.75 0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.02 0.4 0.3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.02 0.4 0.3</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Bin back wall (x-) -->
+    <model name="bin_wall_back">
+      <static>true</static>
+      <pose>0.25 0 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.02 0.4 0.3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.02 0.4 0.3</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Bin left wall (y+) -->
+    <model name="bin_wall_left">
+      <static>true</static>
+      <pose>0.5 0.21 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.5 0.02 0.3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.5 0.02 0.3</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Bin right wall (y-) -->
+    <model name="bin_wall_right">
+      <static>true</static>
+      <pose>0.5 -0.21 0.25 0 0 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><box><size>0.5 0.02 0.3</size></box></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><box><size>0.5 0.02 0.3</size></box></geometry>
+          <material><ambient>0.6 0.4 0.2 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Tomato truss placeholder: a red cylinder lying on its side -->
+    <model name="tomato_truss">
+      <static>true</static>
+      <pose>0.5 0 0.14 0 1.5708 0</pose>
+      <link name="link">
+        <collision name="collision">
+          <geometry><cylinder><radius>0.015</radius><length>0.25</length></cylinder></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><cylinder><radius>0.015</radius><length>0.25</length></cylinder></geometry>
+          <material><ambient>0.8 0.1 0.1 1</ambient></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>
