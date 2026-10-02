@@ -26,6 +26,7 @@ from grasp.srv import pipeline_command, pipeline_commandResponse, set_truss_data
 from common.transforms import transform_pose
 from common.moveit_util import all_close, create_collision_object
 from common.util import flip_z_rotation_stamped_pose
+from common.grasp_motion import post_grasp_poses, PRE_GRASP_GRIPPER_WIDTH_M
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -37,13 +38,21 @@ from pilz_robot_programming import *
 import copy
 import os
 
+# Speed of the straight-line descent from pre-grasp to grasp in grasp(), as fractions
+# of the joint velocity/acceleration limits (other Cartesian moves default to 0.15/0.3).
+GRASP_DESCENT_VELOCITY_SCALING = 0.05
+GRASP_DESCENT_ACCELERATION_SCALING = 0.1
+# Speed of the post-grasp back-out and straight-up lift in grasp() (Cartesian moves;
+# their distances are in common/grasp_motion.py, shared with the reachability checks).
+POST_GRASP_LIFT_VELOCITY_SCALING = 0.15
+POST_GRASP_LIFT_ACCELERATION_SCALING = 0.3
+
 class Planner(object):
 
     def __init__(self, NODE_NAME):
         super(Planner, self).__init__()
         self.node_name = NODE_NAME
 
-        self.vine_radius = 0.0025
         self.succesfull_grasp_force_difference = 0.3 #0.15 for fake
         self.force_limit = 6 #Newton
 
@@ -615,7 +624,8 @@ class Planner(object):
 
     # move end effector straight to goal pose using cartesian path planning,
     # rather than joint-space (OMPL) planning, for a smooth linear approach
-    def go_to_pose_cartesian(self, goal_pose, move_group, eef_step=0.005):
+    def go_to_pose_cartesian(self, goal_pose, move_group, eef_step=0.005,
+                             velocity_scaling=0.15, acceleration_scaling=0.3):
         if goal_pose == None:
             return 'failure'
 
@@ -631,8 +641,8 @@ class Planner(object):
         plan = move_group.retime_trajectory(
             self.robot.get_current_state(),
             plan,
-            velocity_scaling_factor=0.15,
-            acceleration_scaling_factor=0.3,
+            velocity_scaling_factor=velocity_scaling,
+            acceleration_scaling_factor=acceleration_scaling,
         )
 
         # The retimer can leave adjacent waypoints with an identical (or
@@ -691,20 +701,29 @@ class Planner(object):
                 pre_grasp_pose.pose.position.y -= approach_vec[1] * 0.05
                 pre_grasp_pose.pose.position.z -= approach_vec[2] * 0.05
 
-                # Grasp: sink slightly further along approach axis
+                # Grasp: close exactly at the supplied grasp point (no extra sink)
                 grasp_pose = copy.deepcopy(supplied_grasp_pose)
-                grasp_pose.pose.position.x += approach_vec[0] * 0.01
-                grasp_pose.pose.position.y += approach_vec[1] * 0.01
-                grasp_pose.pose.position.z += approach_vec[2] * 0.01
 
                 if self.go_to_pose(goal_pose=pre_grasp_pose, move_group=self.move_group_ee, allow_flip=True, movement="grasp_pre_grasp") == "success":
-                    if self.go_to_pose_cartesian(goal_pose=grasp_pose, move_group=self.move_group_ee) == "success":
+                    # Slow final descent onto the truss (pre-grasp -> grasp)
+                    if self.go_to_pose_cartesian(goal_pose=grasp_pose, move_group=self.move_group_ee,
+                                                 velocity_scaling=GRASP_DESCENT_VELOCITY_SCALING,
+                                                 acceleration_scaling=GRASP_DESCENT_ACCELERATION_SCALING) == "success":
                         if self.close_gripper(save=True) == "success":
-                            # Retreat back along approach axis
-                            post_grasp_pose = copy.deepcopy(supplied_grasp_pose)
-                            post_grasp_pose.pose.position.x -= approach_vec[0] * 0.25
-                            post_grasp_pose.pose.position.y -= approach_vec[1] * 0.25
-                            post_grasp_pose.pose.position.z -= approach_vec[2] * 0.25
+                            # Back out along the approach axis to free the truss from its
+                            # neighbours, then lift it straight up, keeping the grasp orientation
+                            backout_pose, post_grasp_pose = post_grasp_poses(grasp_pose, approach_vec)
+                            for label, target in (("back-out", backout_pose), ("lift", post_grasp_pose)):
+                                if self.go_to_pose_cartesian(goal_pose=target, move_group=self.move_group_ee,
+                                                             velocity_scaling=POST_GRASP_LIFT_VELOCITY_SCALING,
+                                                             acceleration_scaling=POST_GRASP_LIFT_ACCELERATION_SCALING) != "success":
+                                    break
+                            else:
+                                return "success"
+                            # A straight line can be cut short by IK/collisions; the truss
+                            # is already in the gripper, so still get it out with the
+                            # regular planner.
+                            print(f"Straight-line post-grasp {label} failed, falling back to planned post-grasp move")
                             return self.go_to_pose(goal_pose=post_grasp_pose, move_group=self.move_group_ee, allow_flip=True, movement="grasp_post_grasp")
             return "failure"
         finally:
@@ -731,7 +750,7 @@ class Planner(object):
     def pre_grasp_gripper(self):
         self.gripper_move_action.wait_for_server()
         gripper = franka_gripper.msg.MoveGoal()
-        gripper.width = self.vine_radius*2
+        gripper.width = PRE_GRASP_GRIPPER_WIDTH_M
         gripper.speed = 0.1
         self.gripper_move_action.send_goal(gripper)
         self.gripper_move_action.wait_for_result()

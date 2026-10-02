@@ -20,6 +20,7 @@ from tf.transformations import quaternion_from_euler, euler_from_quaternion
 
 from grasp.srv import find_grasp_candidates_command
 from common.transforms import find_transform, transform_pose, transform_pose_array
+from common.grasp_motion import post_grasp_poses, pre_grasp_gripper_state, CartesianMotionChecker
 from common.util import camera_info2rs_intrinsics, pointcloud2numpy, pointcloud2image
 from common.download_model import download_from_google_drive
 
@@ -30,16 +31,12 @@ TILT_ANGLES_DEG = [0, 45, -45, 90, -90]
 # Roll around the (post-X-tilt) gripper-closing axis; stays perpendicular to the stem
 Y_TILT_ANGLES_DEG = [0, 45, -45, 90, -90]
 
-# Must match the pre-grasp/sink/retreat offsets in plan_movement.py's grasp() — IK is
+# Must match the pre-grasp/sink offsets in plan_movement.py's grasp() — IK is
 # checked at these offset poses too, since a reachable grasp point doesn't guarantee
-# the pre-grasp/sink/retreat poses (5cm back / 1cm further in / 25cm back along the
-# approach vector) are reachable. The sink offset matters most in practice: it's the
-# deepest point the gripper actually travels to (plan_movement.py sinks 1cm past the
-# supplied point before closing), so a candidate whose IK looks fine "above the truss"
-# can still fail once the real grasp tries to move in that last bit closer.
+# the pre-grasp/sink poses (5cm back / 0cm further in along the approach vector) are
+# reachable. The post-grasp back-out and lift come from common/grasp_motion.py.
 PRE_GRASP_OFFSET_M = 0.05
-SINK_OFFSET_M = 0.01
-RETREAT_OFFSET_M = 0.25
+SINK_OFFSET_M = 0.0
 
 
 class DetermineGraspCandidatesOrientedKeypoint():
@@ -51,6 +48,7 @@ class DetermineGraspCandidatesOrientedKeypoint():
         self.tfBuffer = tf2_ros.Buffer()
         self.tfListener = tf2_ros.TransformListener(self.tfBuffer)
         self.planning_frame = rospy.get_param('/planning_frame')
+        self.motion_checker = CartesianMotionChecker(rospy.get_param('/robot_name', 'panda'))
         self.camera_frame = rospy.get_param('/camera_frame')
         self.camera_info_sub = rospy.Subscriber("camera/color/camera_info", CameraInfo, self.camera_info_callback)
         self.grasp_candidates_raw_debug_pub = rospy.Publisher('grasp_candidates_raw_debug', Image, queue_size=1, latch=True)
@@ -174,19 +172,24 @@ class DetermineGraspCandidatesOrientedKeypoint():
         return offset
 
     def _check_ik(self, pose_stamped):
-        """Return True only if the grasp pose AND the pre-grasp/retreat poses that
-        plan_movement.py actually plans to (offset along the approach vector) all
-        have a collision-free IK solution. A pose can be reachable on its own while
+        """Return True only if the grasp pose AND the pre-grasp/back-out/lift poses that
+        plan_movement.py actually moves to all have a collision-free IK solution, and
+        the straight lines between them can be followed completely. A pose can be reachable on its own while
         its pre-grasp offset is inside a wall/crate or out of reach, which otherwise
         surfaces later as a MoveIt planning TIMED_OUT during the real grasp attempt."""
         approach_vec = self._get_approach_vec(pose_stamped.pose)
         pre_grasp = self._offset_pose(pose_stamped, approach_vec, PRE_GRASP_OFFSET_M)
         sink = self._offset_pose(pose_stamped, approach_vec, -SINK_OFFSET_M)
-        retreat = self._offset_pose(pose_stamped, approach_vec, RETREAT_OFFSET_M)
-        return (self._check_ik_single(pose_stamped)
+        backout, lift = post_grasp_poses(sink, approach_vec)
+        if not (self._check_ik_single(pose_stamped)
                 and self._check_ik_single(pre_grasp)
                 and self._check_ik_single(sink)
-                and self._check_ik_single(retreat))
+                and self._check_ik_single(backout)
+                and self._check_ik_single(lift)):
+            return False
+        # The straight lines grasp() follows: pre-grasp -> sink -> back-out -> lift
+        ok, _ = self.motion_checker.check(pre_grasp, [sink, backout, lift])
+        return ok
 
     def _check_ik_single(self, pose_stamped):
         """Return True if MoveIt can find a collision-free IK solution for this pose."""
@@ -202,6 +205,7 @@ class DetermineGraspCandidatesOrientedKeypoint():
         req.ik_request.group_name = robot_name + "_manipulator"
         req.ik_request.ik_link_name = robot_name + "_hand_tcp"
         req.ik_request.pose_stamped = pose_stamped
+        req.ik_request.robot_state = pre_grasp_gripper_state(robot_name)
         req.ik_request.avoid_collisions = True
         req.ik_request.timeout = rospy.Duration(0.1)
         try:

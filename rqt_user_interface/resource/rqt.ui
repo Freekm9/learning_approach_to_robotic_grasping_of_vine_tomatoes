@@ -7269,6 +7269,20 @@
      </property>
     </widget>
    </item>
+   <item row="17" column="3">
+    <widget class="QPushButton" name="BabuskaPickPoint">
+     <property name="text">
+      <string>BabuskaPickPoint</string>
+     </property>
+    </widget>
+   </item>
+   <item row="17" column="4">
+    <widget class="QPushButton" name="BabuskaDetect">
+     <property name="text">
+      <string>BabuskaDetect (no motion)</string>
+     </property>
+    </widget>
+   </item>
   </layout>
  </widget>
  <resources/>

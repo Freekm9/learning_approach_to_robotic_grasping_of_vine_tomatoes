@@ -12,9 +12,11 @@ no reason to point it at the real robot for a query that never moves it.
 
 Reachability test mirrors simple_pick_point.py's `_find_reachable_orientation`
 exactly: try the straight-down orientation first (checking the pre-grasp/sink/
-retreat offsets grasp() actually visits, not just the grasp point itself); if
-that's unreachable or in collision, fall back through the same tilt table
-(closest to straight-down first) until one clears IK, or none do.
+back-out/lift poses and straight lines grasp() actually visits, not just the grasp point itself); if
+that's unreachable or in collision, try the same orientation with the wrist
+rolled 180 degrees (free for a symmetric gripper -- see `flip_approach_roll`);
+if that also fails, fall back through the same tilt table (closest to
+straight-down first) until one clears IK, or none do.
 
 Crate geometry (interior opening, wall extents) is read live from the MoveIt
 planning scene rather than hardcoded, so this keeps working if the loaded
@@ -29,6 +31,12 @@ Usage:
 
     # quick smoke test on a handful of points:
     rosrun grasp test_crate_reachability.py --limit-points 4
+
+    # test every combined x-tilt/y-tilt orientation directly (not just the
+    # closest-to-straight-down fallback winner) -- e.g. 20 deg x-tilt crossed
+    # with 20 deg y-tilt, plus their negatives and straight-down:
+    rosrun grasp test_crate_reachability.py --sweep-tilts \\
+        --x-tilt-deg 0 20 -20 --y-tilt-deg 0 20 -20
 """
 import argparse
 import copy
@@ -49,6 +57,8 @@ from tf.transformations import quaternion_from_euler
 from moveit_msgs.msg import MoveItErrorCodes, DisplayRobotState
 from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
 
+from common.grasp_motion import post_grasp_poses, pre_grasp_gripper_state, CartesianMotionChecker
+
 # Reverse lookup (int -> name) built from MoveItErrorCodes' generated int constants,
 # so failed compute_ik calls can be logged as e.g. "NO_IK_SOLUTION" instead of a bare
 # int -- diagnostic only, doesn't affect which poses count as reachable.
@@ -63,17 +73,24 @@ def moveit_error_string(val):
 
 # Must match plan_movement.py's grasp() / simple_pick_point.py's _check_ik --
 # a reachable grasp point doesn't guarantee the offset poses grasp() actually
-# visits are reachable too, so every candidate is checked at all four.
+# visits are reachable too, so every candidate is checked at all of them
+# (back-out/lift: common/grasp_motion.py).
 PRE_GRASP_OFFSET_M = 0.05
-SINK_OFFSET_M = 0.01
-RETREAT_OFFSET_M = 0.25
+SINK_OFFSET_M = 0.0
+
+# TRAC-IK (see kinematics.yaml) does randomized internal restarts within its timeout,
+# so a single NO_IK_SOLUTION on a pose near the edge of the workspace can be a false
+# negative -- retry a few times before treating a pose as genuinely unreachable. Must
+# match simple_pick_point.py's IK_CHECK_RETRIES so this sweep reports the same verdict
+# the live pipeline would reach.
+IK_CHECK_RETRIES = 3
 
 # Fallback orientations tried when the straight-down grasp is unreachable/in
 # collision -- identical table to simple_pick_point.py's TILT_ANGLES_DEG /
 # Y_TILT_ANGLES_DEG, so a point marked "reachable via tilt" here means
 # simple_pick_point.py would actually find it too.
-TILT_ANGLES_DEG = [0, 45, -45, 90, -90]
-Y_TILT_ANGLES_DEG = [0, 45, -45, 90, -90]
+TILT_ANGLES_DEG = [0, 20, -20, 40, -40, 60, -60, 80, -80]
+Y_TILT_ANGLES_DEG = [0, 20, -20, 40, -40, 60, -60, 80, -80]
 
 
 # --------------------------------------------------------------------------
@@ -118,6 +135,22 @@ def tilt_pose(pose_stamped, deg_x, deg_y):
     return tilted
 
 
+def flip_approach_roll(pose_stamped):
+    """Return a copy of pose_stamped rolled 180 degrees around its own approach axis
+    (TCP z). Mirrors simple_pick_point.py's _flip_approach_roll exactly -- a symmetric
+    parallel-jaw gripper grasps identically either way, but this puts the wrist (last
+    joint) at a completely different angle, which can clear a joint limit the original
+    roll couldn't."""
+    o = pose_stamped.pose.orientation
+    base_rot = R.from_quat([o.x, o.y, o.z, o.w])
+    flipped_rot = base_rot * R.from_rotvec([0, 0, np.pi])
+    new_q = flipped_rot.as_quat()
+
+    flipped = copy.deepcopy(pose_stamped)
+    flipped.pose.orientation.x, flipped.pose.orientation.y, flipped.pose.orientation.z, flipped.pose.orientation.w = new_q
+    return flipped
+
+
 class IKChecker:
     def __init__(self, robot_name, visualize=False, visualize_pause_s=1.0):
         # Fully-qualified (leading-slash) name -- gazebo_moveit.launch/launch_moveit.launch
@@ -129,9 +162,11 @@ class IKChecker:
         rospy.loginfo(f"Waiting for {ik_service_name} ...")
         rospy.wait_for_service(ik_service_name, timeout=30.0)
         self.service = rospy.ServiceProxy(ik_service_name, GetPositionIK)
+        self.robot_name = robot_name
         self.group_name = robot_name + "_manipulator"
         self.link_name = robot_name + "_hand_tcp"
         self.num_calls = 0
+        self.motion_checker = CartesianMotionChecker(robot_name, ns=f'/{robot_name}/')
 
         # If set, publish every solved grasp pose's joint solution as a DisplayRobotState so
         # it shows up as a "ghost" robot in RViz -- this never commands the real/simulated
@@ -144,55 +179,78 @@ class IKChecker:
                                                 DisplayRobotState, queue_size=1, latch=True)
 
     def check_single(self, pose_stamped, capture_solution=False):
-        """Return True if MoveIt can find a collision-free IK solution for this pose.
+        """Return True if MoveIt can find a collision-free IK solution for this pose,
+        retrying up to IK_CHECK_RETRIES times (see its comment) before giving up.
 
         capture_solution=True additionally publishes the found joint solution for RViz
         (see __init__) and pauses briefly so it's actually visible before the next point
         overwrites it -- only meant for the primary grasp pose, not the pre-grasp/sink/
-        retreat offsets check_grasp() also checks, so the sweep doesn't slow to a crawl."""
+        back-out/lift poses check_grasp() also checks, so the sweep doesn't slow to a crawl."""
+        for attempt in range(IK_CHECK_RETRIES):
+            ok, error_code, res = self._call_once(pose_stamped)
+            if ok:
+                if attempt > 0:
+                    rospy.loginfo_throttle(1.0, f"IK succeeded on retry {attempt + 1}/{IK_CHECK_RETRIES}")
+                if capture_solution and self.visualize:
+                    self.display_pub.publish(DisplayRobotState(state=res.solution))
+                    rospy.sleep(self.visualize_pause_s)
+                return True
+        rospy.loginfo_throttle(1.0, f"IK failed after {IK_CHECK_RETRIES} attempts: "
+                                     f"error_code={error_code} ({moveit_error_string(error_code)})")
+        return False
+
+    def _call_once(self, pose_stamped):
+        """Single compute_ik call. Returns (ok, error_code, response)."""
         self.num_calls += 1
         req = GetPositionIKRequest()
         req.ik_request.group_name = self.group_name
         req.ik_request.ik_link_name = self.link_name
         req.ik_request.pose_stamped = pose_stamped
+        req.ik_request.robot_state = pre_grasp_gripper_state(self.robot_name)
         req.ik_request.avoid_collisions = True
         req.ik_request.timeout = rospy.Duration(0.1)
         try:
             res = self.service(req)
-            if res.error_code.val != 1:
-                rospy.loginfo_throttle(1.0, f"IK failed: error_code={res.error_code.val} "
-                                             f"({moveit_error_string(res.error_code.val)})")
-            elif capture_solution and self.visualize:
-                self.display_pub.publish(DisplayRobotState(state=res.solution))
-                rospy.sleep(self.visualize_pause_s)
-            return res.error_code.val == 1
+            return res.error_code.val == 1, res.error_code.val, res
         except rospy.ServiceException as e:
             rospy.logwarn(f"IK service call failed: {e}")
-            return False
+            return False, None, None
 
     def check_grasp(self, pose_stamped):
-        """Return True only if the pose AND the pre-grasp/sink/retreat poses
-        plan_movement.py's grasp() actually plans to all have a collision-free
-        IK solution. Mirrors simple_pick_point.py's _check_ik."""
+        """Return True only if the pose AND the pre-grasp/sink/back-out/lift poses
+        plan_movement.py's grasp() actually moves to all have a collision-free
+        IK solution, and the straight lines between them can be followed
+        completely. Mirrors simple_pick_point.py's _check_ik."""
         approach_vec = get_approach_vec(pose_stamped.pose)
         pre_grasp = offset_pose(pose_stamped, approach_vec, PRE_GRASP_OFFSET_M)
         sink = offset_pose(pose_stamped, approach_vec, -SINK_OFFSET_M)
-        retreat = offset_pose(pose_stamped, approach_vec, RETREAT_OFFSET_M)
-        return (self.check_single(pose_stamped, capture_solution=True)
+        backout, lift = post_grasp_poses(sink, approach_vec)
+        if not (self.check_single(pose_stamped, capture_solution=True)
                 and self.check_single(pre_grasp)
                 and self.check_single(sink)
-                and self.check_single(retreat))
+                and self.check_single(backout)
+                and self.check_single(lift)):
+            return False
+        ok, _ = self.motion_checker.check(pre_grasp, [sink, backout, lift])
+        return ok
 
 
 def find_reachable_tilt(ik, base_pose):
-    """Try straight-down first; if unreachable, fall back through the tilt
-    table closest-to-straight-down first. Returns (reachable, tilt_x_deg,
-    tilt_y_deg) -- tilt is (0, 0) for a straight-down success, None/None if
-    nothing in the table worked either. Mirrors
-    simple_pick_point.py's _find_reachable_orientation, but reports which
-    tilt worked instead of just the resulting pose."""
+    """Try straight-down first; if unreachable, try the same orientation with the
+    wrist rolled 180 degrees (free for a symmetric gripper -- see
+    flip_approach_roll); if that also fails, fall back through the tilt table
+    closest-to-straight-down first. Returns (reachable, tilt_x_deg, tilt_y_deg,
+    flip) -- tilt is (0, 0) for a straight-down success, flip is True if the
+    180-degree wrist roll was what worked, None/None/None if nothing in the
+    table worked either. Mirrors simple_pick_point.py's
+    _find_reachable_orientation, but reports which tilt/flip worked instead of
+    just the resulting pose."""
     if ik.check_grasp(base_pose):
-        return True, 0, 0
+        return True, 0, 0, False
+
+    flipped = flip_approach_roll(base_pose)
+    if ik.check_grasp(flipped):
+        return True, 0, 0, True
 
     tilts = [(dx, dy) for dx in TILT_ANGLES_DEG for dy in Y_TILT_ANGLES_DEG
              if not (dx == 0 and dy == 0)]
@@ -200,9 +258,19 @@ def find_reachable_tilt(ik, base_pose):
     for dx, dy in tilts:
         candidate = tilt_pose(base_pose, dx, dy)
         if ik.check_grasp(candidate):
-            return True, dx, dy
+            return True, dx, dy, False
 
-    return False, None, None
+    return False, None, None, None
+
+
+def combined_tilt_pairs(x_tilts_deg, y_tilts_deg):
+    """Full cross product of the given x-tilt and y-tilt lists, deduplicated,
+    straight-down (0, 0) always included, closest-to-straight-down first --
+    used by --sweep-tilts to test every combination directly instead of
+    stopping at find_reachable_tilt's first reachable one."""
+    pairs = {(0.0, 0.0)}
+    pairs.update((float(dx), float(dy)) for dx in x_tilts_deg for dy in y_tilts_deg)
+    return sorted(pairs, key=lambda t: (abs(t[0]) + abs(t[1]), t))
 
 
 def build_straight_down_pose(x, y, z, yaw_deg, frame_id):
@@ -440,6 +508,22 @@ def main():
     parser.add_argument('--visualize-pause-s', type=float, default=1.0,
                          help="Seconds to pause after each solved pose when --visualize is set, "
                               "so it's actually visible before the next point overwrites it")
+    parser.add_argument('--sweep-tilts', action='store_true',
+                         help="Instead of the default fallback search (stop at the first "
+                              "reachable tilt, closest-to-straight-down first), test every "
+                              "combination of --x-tilt-deg x --y-tilt-deg directly, at both "
+                              "wrist rolls (see flip_approach_roll), at each ring point/yaw "
+                              "and log each one as its own row. Straight-down (0, 0) is "
+                              "always included alongside the given combinations.")
+    parser.add_argument('--x-tilt-deg', type=float, nargs='+', default=TILT_ANGLES_DEG,
+                         help="Tilt angles (deg) around the vine axis (TCP x-axis) to cross "
+                              "with --y-tilt-deg when --sweep-tilts is set. Ignored otherwise. "
+                              f"Default: {TILT_ANGLES_DEG}")
+    parser.add_argument('--y-tilt-deg', type=float, nargs='+', default=Y_TILT_ANGLES_DEG,
+                         help="Tilt angles (deg) around the resulting gripper-closing axis "
+                              "(TCP y-axis, applied after the x-tilt so it stays perpendicular "
+                              "to the stem) to cross with --x-tilt-deg when --sweep-tilts is "
+                              f"set. Ignored otherwise. Default: {Y_TILT_ANGLES_DEG}")
     args = parser.parse_args(rospy.myargv()[1:])
 
     rospy.init_node('test_crate_reachability')
@@ -474,49 +558,98 @@ def main():
         ring_points = ring_points[:args.limit_points]
 
     yaw_list = list(np.arange(0, 360, args.yaw_step_deg))
-    total = len(ring_points) * len(yaw_list)
-    print(f"{len(ring_points)} ring points x {len(yaw_list)} yaw angles = {total} reachability checks "
-          f"(4 IK calls each: grasp + pre-grasp + sink + retreat)\n")
+
+    tilt_pairs = None
+    if args.sweep_tilts:
+        tilt_pairs = combined_tilt_pairs(args.x_tilt_deg, args.y_tilt_deg)
+        total = len(ring_points) * len(yaw_list) * len(tilt_pairs) * 2  # x2 for the wrist-roll flip
+        print(f"{len(ring_points)} ring points x {len(yaw_list)} yaw angles x {len(tilt_pairs)} "
+              f"tilt combinations x 2 wrist rolls = {total} reachability checks "
+              f"(5 IK calls each: grasp + pre-grasp + sink + back-out + lift, plus a straight-line path check)\n")
+    else:
+        total = len(ring_points) * len(yaw_list)
+        print(f"{len(ring_points)} ring points x {len(yaw_list)} yaw angles = {total} reachability checks "
+              f"(5 IK calls each: grasp + pre-grasp + sink + back-out + lift, plus a straight-line path check)\n")
 
     ik = IKChecker(args.robot_name, visualize=args.visualize, visualize_pause_s=args.visualize_pause_s)
 
     log_path = get_log_path()
-    write_header = not os.path.exists(log_path)
     fieldnames = ["timestamp", "point_idx", "x", "y", "z", "nearest_wall", "yaw_deg",
-                  "reachable", "tilt_x_deg", "tilt_y_deg", "elapsed_s"]
+                  "reachable", "tilt_x_deg", "tilt_y_deg", "flip", "elapsed_s"]
+    # Appending rows with different columns under an existing header makes the log
+    # unreadable (pandas: "Expected 11 fields ... saw 12"), so a log written with
+    # other columns is moved aside and a new one started.
+    if os.path.exists(log_path):
+        with open(log_path, newline='') as f:
+            existing_header = next(csv.reader(f), None)
+        if existing_header != fieldnames:
+            old_path = log_path.replace(".csv", time.strftime("_old_format_%Y%m%d_%H%M%S.csv"))
+            os.rename(log_path, old_path)
+            print(f"Log columns changed; moved previous log to {old_path}")
+    write_header = not os.path.exists(log_path)
     with open(log_path, 'a', newline='') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
             writer.writeheader()
 
         checked = 0
+
+        def report_row(point_idx, x, y, nearest_wall, yaw_deg, tilt_x, tilt_y, flip, reachable, elapsed):
+            nonlocal checked
+            checked += 1
+            writer.writerow({
+                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "point_idx": point_idx,
+                "x": round(x, 4),
+                "y": round(y, 4),
+                "z": round(test_z, 4),
+                "nearest_wall": nearest_wall,
+                "yaw_deg": yaw_deg,
+                "reachable": reachable,
+                "tilt_x_deg": tilt_x,
+                "tilt_y_deg": tilt_y,
+                "flip": flip,
+                "elapsed_s": round(elapsed, 3),
+            })
+            f.flush()
+
+            flip_str = " flip" if flip else ""
+            if reachable and tilt_x == 0 and tilt_y == 0:
+                tilt_str = "straight-down" + flip_str
+            elif reachable:
+                tilt_str = f"tilt=({tilt_x},{tilt_y}){flip_str}"
+            elif args.sweep_tilts:
+                tilt_str = f"tilt=({tilt_x},{tilt_y}){flip_str} UNREACHABLE"
+            else:
+                tilt_str = "UNREACHABLE"
+            print(f"[{checked}/{total}] point {point_idx} ({x:.3f}, {y:.3f}, {nearest_wall}) "
+                  f"yaw={yaw_deg:5.1f}°  {tilt_str}  ({elapsed:.2f}s, {ik.num_calls} IK calls so far)")
+
         for point_idx, (x, y, nearest_wall) in enumerate(ring_points):
             for yaw_deg in yaw_list:
                 base_pose = build_straight_down_pose(x, y, test_z, yaw_deg, planning_frame)
-                t0 = time.time()
-                reachable, tilt_x, tilt_y = find_reachable_tilt(ik, base_pose)
-                elapsed = time.time() - t0
-                checked += 1
 
-                writer.writerow({
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "point_idx": point_idx,
-                    "x": round(x, 4),
-                    "y": round(y, 4),
-                    "z": round(test_z, 4),
-                    "nearest_wall": nearest_wall,
-                    "yaw_deg": yaw_deg,
-                    "reachable": reachable,
-                    "tilt_x_deg": tilt_x,
-                    "tilt_y_deg": tilt_y,
-                    "elapsed_s": round(elapsed, 3),
-                })
-                f.flush()
-
-                tilt_str = "straight-down" if (reachable and tilt_x == 0 and tilt_y == 0) else \
-                    (f"tilt=({tilt_x},{tilt_y})" if reachable else "UNREACHABLE")
-                print(f"[{checked}/{total}] point {point_idx} ({x:.3f}, {y:.3f}, {nearest_wall}) "
-                      f"yaw={yaw_deg:5.1f}°  {tilt_str}  ({elapsed:.2f}s, {ik.num_calls} IK calls so far)")
+                if args.sweep_tilts:
+                    # Write+print each combo immediately after it's checked, not after the
+                    # whole tilt sweep for this yaw finishes -- otherwise ik.num_calls (and
+                    # the printed progress) freezes for the whole batch and then jumps all at
+                    # once, making already-real-time work look like it happened instantly.
+                    for tilt_x, tilt_y in tilt_pairs:
+                        tilted = base_pose if (tilt_x == 0 and tilt_y == 0) \
+                            else tilt_pose(base_pose, tilt_x, tilt_y)
+                        for flip in (False, True):
+                            candidate = flip_approach_roll(tilted) if flip else tilted
+                            t0 = time.time()
+                            reachable = ik.check_grasp(candidate)
+                            elapsed = time.time() - t0
+                            report_row(point_idx, x, y, nearest_wall, yaw_deg,
+                                       tilt_x, tilt_y, flip, reachable, elapsed)
+                else:
+                    t0 = time.time()
+                    reachable, tilt_x, tilt_y, flip = find_reachable_tilt(ik, base_pose)
+                    elapsed = time.time() - t0
+                    report_row(point_idx, x, y, nearest_wall, yaw_deg,
+                               tilt_x, tilt_y, flip, reachable, elapsed)
 
     print(f"\nDone. Log: {log_path}")
 

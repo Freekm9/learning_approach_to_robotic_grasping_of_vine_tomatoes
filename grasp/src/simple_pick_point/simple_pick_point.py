@@ -15,26 +15,51 @@ from threading import Lock
 from grasp.srv import pipeline_command, set_grasp_pose_command
 from common.util import camera_info2rs_intrinsics, DepthImageFilter
 from common.transforms import transform_pose
+from common.grasp_motion import post_grasp_poses, pre_grasp_gripper_state, CartesianMotionChecker
+from babuska_pick_point import BabuskaPicker
 
+from moveit_msgs.msg import MoveItErrorCodes
 from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
 
-# Must match the pre-grasp/sink/retreat offsets in plan_movement.py's grasp() — IK is
+# Reverse lookup (int -> name) for logging failed compute_ik calls (e.g. "NO_IK_SOLUTION"
+# instead of a bare int) -- diagnostic only, doesn't affect which poses count as reachable.
+_ERROR_CODE_NAMES = {getattr(MoveItErrorCodes, name): name
+                      for name in dir(MoveItErrorCodes)
+                      if name.isupper() and isinstance(getattr(MoveItErrorCodes, name), int)}
+
+
+def moveit_error_string(val):
+    return _ERROR_CODE_NAMES.get(val, f"UNKNOWN({val})")
+
+# Must match the pre-grasp/sink offsets in plan_movement.py's grasp() — IK is
 # checked at these offset poses too, since a reachable grasp point doesn't guarantee
-# the pre-grasp/sink/retreat poses (5cm back / 1cm further in / 25cm back along the
-# approach vector) are reachable. The sink offset matters most in practice: it's the
-# deepest point the gripper actually travels to (plan_movement.py sinks 1cm past the
+# the pre-grasp/sink poses (5cm back / 0cm further in along the approach vector) are
+# reachable. The post-grasp back-out and lift come from common/grasp_motion.py. The sink offset matters most in practice: it's the
+# deepest point the gripper actually travels to (plan_movement.py sinks 0cm past the
 # supplied point before closing), so a candidate whose IK looks fine "above the truss"
 # can still fail once the real grasp tries to move in that last bit closer.
 PRE_GRASP_OFFSET_M = 0.05
-SINK_OFFSET_M = 0.01
-RETREAT_OFFSET_M = 0.25
+SINK_OFFSET_M = 0.0
+
+# TRAC-IK (see kinematics.yaml) does randomized internal restarts within its timeout,
+# so a single NO_IK_SOLUTION on a pose near the edge of the workspace can be a false
+# negative -- retry a few times before treating a pose as genuinely unreachable.
+IK_CHECK_RETRIES = 3
+
+# Diagnostic only: heights (in meters, along the approach vector, relative to the grasp
+# point) sampled by _log_depth_profile when a grasp is rejected, to show exactly how far
+# back the arm would need to stay to become reachable -- negative is deeper than the
+# grasp point (sink direction), positive is further back/shallower (pre_grasp
+# direction), in 5cm steps up to 25cm back.
+DEPTH_PROBE_DISTANCES_M = sorted({-SINK_OFFSET_M, 0.0, PRE_GRASP_OFFSET_M, 0.10, 0.15, 0.20, 0.25})
+DEPTH_PROBE_LABELS = {-SINK_OFFSET_M: "sink", 0.0: "grasp", PRE_GRASP_OFFSET_M: "pre_grasp"}
 
 # Fallback orientations tried when the straight-down grasp is unreachable/in collision.
 # Same angle set used for vision-based candidates (determine_grasp_candidates_manual.py).
 # Tilt angles (degrees) around vine axis: 0° = top-down, ±90° = horizontal approach
-TILT_ANGLES_DEG = [0, 45, -45, 90, -90]
+TILT_ANGLES_DEG = [0, 20, -20, 40, -40, 60, -60, 80, -80]
 # Roll around the (post-X-tilt) gripper-closing axis; stays perpendicular to the stem
-Y_TILT_ANGLES_DEG = [0, 45, -45, 90, -90]
+Y_TILT_ANGLES_DEG = [0, 20, -20, 40, -40, 60, -60, 80, -80]
 
 # How many reachable pre-grasp orientations to cycle the arm through for
 # "Test Pre-Grasp Positions", and how long to hold at each one so the
@@ -68,14 +93,21 @@ class SimplePickPoint():
 
         self.simple_pick_point_service = rospy.Service('simple_pick_point', pipeline_command, self.execute_command)
         self.test_pre_grasp_positions_service = rospy.Service('test_pre_grasp_positions', pipeline_command, self.execute_test_pre_grasp_positions)
+        # Same as simple_pick_point, but the grasp point and stem direction come from
+        # find_tomato_grasp (one click on the truss) instead of two manual clicks.
+        self.babuska_pick_point_service = rospy.Service('babuska_pick_point', pipeline_command, self.execute_babuska_pick_point)
+        # Detection only, for testing the detector: prints the grasp pose, never moves the robot.
+        self.babuska_detect_service = rospy.Service('babuska_detect', pipeline_command, self.execute_babuska_detect)
 
         self.set_grasp_pose_service = None
         self.move_robot_service = None
         self.ik_service = None
+        self.motion_checker = CartesianMotionChecker(rospy.get_param('/robot_name', 'panda'))
 
         self.collect_image = False
         self.collect_depth_image = False
         self.draw = False
+        self.picker = "manual"  # "manual" (PickTwoPoints) or "babuska" (BabuskaPicker)
         self.points = None
         self.lock = Lock()
 
@@ -94,10 +126,12 @@ class SimplePickPoint():
             self.camera_info = msg
             self.rs_intrinsics = camera_info2rs_intrinsics(msg)
 
-    def execute_command(self, command):
-        grasp_pose = self._capture_and_pick_grasp_pose()
+    def execute_command(self, command, picker="manual"):
+        grasp_pose = self._capture_and_pick_grasp_pose(picker)
         if grasp_pose is None:
             return "failure"
+
+        self._log_grasp_pose(grasp_pose, "Requested grasp pose")
 
         grasp_pose = self._find_reachable_orientation(grasp_pose)
         if grasp_pose is None:
@@ -105,6 +139,35 @@ class SimplePickPoint():
             return "failure"
 
         return self.grasp(grasp_pose)
+
+    def execute_babuska_pick_point(self, command):
+        return self.execute_command(command, picker="babuska")
+
+    def execute_babuska_detect(self, command):
+        """Run the Babuska detector on a fresh frame and print the resulting grasp pose
+        and whether it is reachable, without moving the robot."""
+        grasp_pose = self._capture_and_pick_grasp_pose("babuska")
+        if grasp_pose is None:
+            return "failure"
+        self._log_grasp_pose(grasp_pose, "Detected grasp pose")
+        reachable = self._find_reachable_orientation(grasp_pose)
+        if reachable is None:
+            print("Detected grasp pose has no reachable orientation")
+        else:
+            self._log_grasp_pose(reachable, "Reachable grasp pose")
+        return "success"
+
+    def _log_grasp_pose(self, pose_stamped, label):
+        """Print position + orientation (as roll/pitch/yaw, tf's static-frame/'sxyz'
+        convention -- same as tf.transformations.quaternion_from_euler) for comparing
+        a real pick against test_crate_reachability.py's synthetic straight-down poses
+        (roll=180, pitch=0) at the same (x, y)."""
+        p = pose_stamped.pose.position
+        o = pose_stamped.pose.orientation
+        rpy_deg = R.from_quat([o.x, o.y, o.z, o.w]).as_euler('xyz', degrees=True)
+        print(f"{label} [{pose_stamped.header.frame_id}]: "
+              f"pos=({p.x:.4f}, {p.y:.4f}, {p.z:.4f})  "
+              f"rpy_deg=({rpy_deg[0]:.1f}, {rpy_deg[1]:.1f}, {rpy_deg[2]:.1f})")
 
     def execute_test_pre_grasp_positions(self, command):
         """Like execute_command, but instead of grasping, cycles the arm through
@@ -130,8 +193,9 @@ class SimplePickPoint():
 
         return "success"
 
-    def _capture_and_pick_grasp_pose(self):
-        """Grab a fresh frame, let the user click a grasp point + stem direction,
+    def _capture_and_pick_grasp_pose(self, picker="manual"):
+        """Grab a fresh frame, let the user click a grasp point + stem direction
+        (picker="manual") or select a truss for find_tomato_grasp (picker="babuska"),
         and return the resulting grasp pose in the planning frame. Returns None
         on any failure, having already printed why."""
         print("Grabbing frame")
@@ -150,6 +214,7 @@ class SimplePickPoint():
 
         # Draw from the main thread, since opencv can't handle it otherwise
         self.preprocessed_image = rgb_image
+        self.picker = picker
         self.points = None
         self.draw = True
         while self.points is None:
@@ -234,12 +299,54 @@ class SimplePickPoint():
         tilted.pose.orientation.x, tilted.pose.orientation.y, tilted.pose.orientation.z, tilted.pose.orientation.w = new_q
         return tilted
 
+    def _flip_approach_roll(self, pose_stamped):
+        """Return a copy of pose_stamped rolled 180° around its own approach axis (TCP z).
+        A symmetric parallel-jaw gripper grasps the stem identically either way, but this
+        puts the wrist (last joint) at a completely different angle -- which can clear a
+        joint limit that the original roll couldn't, at zero cost to grasp quality."""
+        o = pose_stamped.pose.orientation
+        base_rot = R.from_quat([o.x, o.y, o.z, o.w])
+        flipped_rot = base_rot * R.from_rotvec([0, 0, np.pi])
+        new_q = flipped_rot.as_quat()
+
+        flipped = copy.deepcopy(pose_stamped)
+        flipped.pose.orientation.x, flipped.pose.orientation.y, flipped.pose.orientation.z, flipped.pose.orientation.w = new_q
+        return flipped
+
+    def _log_depth_profile(self, pose_stamped, orientation_label):
+        """Print IK reachability at a range of heights along the approach vector,
+        centered on the grasp point (0m) -- negative is deeper (sink direction),
+        positive is further back/shallower (pre_grasp direction). Shows
+        exactly how far back the arm would need to stay to become reachable, i.e.
+        whether the bottleneck is depth-related at all or the point is out of reach
+        even well clear of the crate."""
+        approach_vec = self._get_approach_vec(pose_stamped.pose)
+        print(f"  Approach-depth reachability profile ({orientation_label}, "
+              f"0cm=grasp point, +=shallower/back, -=deeper):")
+        for dist in DEPTH_PROBE_DISTANCES_M:
+            probe = self._offset_pose(pose_stamped, approach_vec, dist)
+            ok = self._check_ik_single(probe)
+            label = DEPTH_PROBE_LABELS.get(dist)
+            label_str = f" ({label})" if label else ""
+            print(f"    {dist * 100:+5.1f}cm{label_str}: {'reachable' if ok else 'UNREACHABLE'}")
+
     def _find_reachable_orientation(self, grasp_pose):
         """Try the straight-down orientation first; if it's unreachable or in collision,
-        fall back to other tilt/roll combinations (closest to straight-down first) until
-        one clears IK, including the pre-grasp/retreat offsets."""
-        if self._check_ik(grasp_pose):
+        try the same orientation with the wrist rolled 180° (free for a symmetric gripper,
+        see _flip_approach_roll); if that also fails, fall back to other tilt/roll
+        combinations (closest to straight-down first) until one clears IK, including the
+        pre-grasp offset and the post-grasp back-out/lift (see _check_ik)."""
+        if self._check_ik(grasp_pose, verbose=True):
             return grasp_pose
+
+        self._log_depth_profile(grasp_pose, "straight-down")
+
+        flipped = self._flip_approach_roll(grasp_pose)
+        if self._check_ik(flipped):
+            print("Found reachable orientation via 180° wrist-roll flip (straight-down)")
+            return flipped
+
+        self._log_depth_profile(flipped, "180° flip")
 
         print("Straight-down grasp unreachable, checking other gripper orientations...")
         tilts = [(deg_x, deg_y) for deg_x in TILT_ANGLES_DEG for deg_y in Y_TILT_ANGLES_DEG
@@ -261,6 +368,10 @@ class SimplePickPoint():
         candidates = []
         if self._check_ik(grasp_pose):
             candidates.append(grasp_pose)
+
+        flipped = self._flip_approach_roll(grasp_pose)
+        if self._check_ik(flipped):
+            candidates.append(flipped)
 
         tilts = [(deg_x, deg_y) for deg_x in TILT_ANGLES_DEG for deg_y in Y_TILT_ANGLES_DEG
                   if not (deg_x == 0 and deg_y == 0)]
@@ -288,43 +399,89 @@ class SimplePickPoint():
         self.set_grasp_pose_service(grasp_pose)
         return self.move_robot_service("go_to_pre_grasp").success
 
-    def _check_ik(self, pose_stamped):
-        """Return True only if the grasp pose AND the pre-grasp/retreat poses that
-        plan_movement.py actually plans to (offset along the approach vector) all
-        have a collision-free IK solution."""
+    def _check_ik(self, pose_stamped, verbose=False):
+        """Return True only if the grasp pose AND the pre-grasp/back-out/lift poses that
+        plan_movement.py actually moves to all have a collision-free IK solution, and
+        the straight lines between them (pre-grasp -> sink -> back-out -> lift, as
+        executed by grasp()) can be followed completely.
+
+        verbose=True additionally checks (and prints the failure reason for) all
+        offsets instead of short-circuiting on the first failure -- only meant
+        for the initial straight-down attempt, to pinpoint e.g. a sink-offset
+        collision with the crate wall vs. no IK solution at all."""
         approach_vec = self._get_approach_vec(pose_stamped.pose)
         pre_grasp = self._offset_pose(pose_stamped, approach_vec, PRE_GRASP_OFFSET_M)
         sink = self._offset_pose(pose_stamped, approach_vec, -SINK_OFFSET_M)
-        retreat = self._offset_pose(pose_stamped, approach_vec, RETREAT_OFFSET_M)
-        return (self._check_ik_single(pose_stamped)
-                and self._check_ik_single(pre_grasp)
-                and self._check_ik_single(sink)
-                and self._check_ik_single(retreat))
+        backout, lift = post_grasp_poses(sink, approach_vec)
+        poses = [("grasp", pose_stamped), ("pre_grasp", pre_grasp), ("sink", sink),
+                 ("back-out", backout), ("lift", lift)]
+        if not verbose:
+            return (all(self._check_ik_single(pose) for _, pose in poses)
+                    and self._check_motion(pre_grasp, sink, backout, lift))
 
-    def _check_ik_single(self, pose_stamped):
-        """Return True if MoveIt can find a collision-free IK solution for this pose."""
+        results = {label: self._check_ik_single(pose, label=label) for label, pose in poses}
+        return all(results.values()) and self._check_motion(pre_grasp, sink, backout, lift, verbose=True)
+
+    def _check_motion(self, pre_grasp, sink, backout, lift, verbose=False):
+        """Return True if grasp()'s straight-line moves, pre-grasp -> sink (descent),
+        -> back-out -> lift, can each be followed completely, chained from an IK
+        solution at the pre-grasp pose."""
+        ok, reason = self.motion_checker.check(pre_grasp, [sink, backout, lift],
+                                               labels=["grasp", "back-out", "lift"])
+        if verbose and not ok:
+            print(f"    straight-line motion: {reason}")
+        return ok
+
+    def _check_ik_single(self, pose_stamped, label=None):
+        """Return True if MoveIt can find a collision-free IK solution for this pose,
+        retrying up to IK_CHECK_RETRIES times (see its comment -- TRAC-IK's randomized
+        restarts mean a single NO_IK_SOLUTION near the edge of the workspace can be a
+        false negative). When label is given, print the failure reason on the final
+        failed attempt -- used for the verbose straight-down diagnostic."""
+        ok, error_code = False, None
+        for attempt in range(IK_CHECK_RETRIES):
+            ok, error_code = self._call_ik_once(pose_stamped)
+            if ok:
+                if label is not None and attempt > 0:
+                    print(f"    {label} offset: IK succeeded on retry {attempt + 1}/{IK_CHECK_RETRIES}")
+                return True
+        if label is not None:
+            print(f"    {label} offset: IK failed after {IK_CHECK_RETRIES} attempts "
+                  f"(error_code={error_code}, {moveit_error_string(error_code)})")
+        return False
+
+    def _call_ik_once(self, pose_stamped):
+        """Single compute_ik call. Returns (ok, error_code); error_code is None if the
+        service itself was unavailable/errored rather than returning a MoveIt error code."""
         if self.ik_service is None:
             try:
                 rospy.wait_for_service('compute_ik', timeout=2.0)
                 self.ik_service = rospy.ServiceProxy('compute_ik', GetPositionIK)
             except rospy.ROSException:
                 print("Warning: compute_ik not available, skipping IK filter")
-                return True
+                return True, None
         robot_name = rospy.get_param('/robot_name', 'panda')
         req = GetPositionIKRequest()
         req.ik_request.group_name = robot_name + "_manipulator"
         req.ik_request.ik_link_name = robot_name + "_hand_tcp"
         req.ik_request.pose_stamped = pose_stamped
+        req.ik_request.robot_state = pre_grasp_gripper_state(robot_name)
         req.ik_request.avoid_collisions = True
         req.ik_request.timeout = rospy.Duration(0.1)
         try:
             res = self.ik_service(req)
-            return res.error_code.val == 1
+            return res.error_code.val == 1, res.error_code.val
         except rospy.ServiceException as e:
             print(f"IK service call failed: {e}")
-            return False
+            return False, None
 
     def draw_pick_point(self, rgb_image):
+        if self.picker == "babuska":
+            picker = BabuskaPicker()
+            picker.reset(copy.deepcopy(rgb_image))
+            picker.draw()
+            self.points = picker.points() if picker.save else False
+            return
         picker = PickTwoPoints()
         picker.reset(copy.deepcopy(rgb_image))
         picker.draw()

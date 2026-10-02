@@ -70,9 +70,12 @@ class RqtPipeline(Plugin):
         self._widget.ToggleExecuteFullPipelineRepeat.clicked[bool].connect(lambda: self.send_command_to_pipeline("toggle_execute_full_pipeline_repeat"))
         self._widget.SimplePickPoint.clicked[bool].connect(self.trigger_simple_pick_point)
         self._widget.TestPreGraspPositions.clicked[bool].connect(self.trigger_test_pre_grasp_positions)
+        self._widget.BabuskaPickPoint.clicked[bool].connect(lambda: self.trigger_simple_pick_point_service('babuska_pick_point'))
+        self._widget.BabuskaDetect.clicked[bool].connect(lambda: self.trigger_simple_pick_point_service('babuska_detect'))
 
         self.simple_pick_point_service = None
         self.test_pre_grasp_positions_service = None
+        self.simple_pick_point_services = {}
 
     def trigger_simple_pick_point(self):
         # Bypasses the pipeline/smach dispatch: this service does the whole
@@ -94,6 +97,17 @@ class RqtPipeline(Plugin):
             self.test_pre_grasp_positions_service = rospy.ServiceProxy('test_pre_grasp_positions', pipeline_command)
         try:
             self.test_pre_grasp_positions_service("test_pre_grasp_positions")
+        except rospy.ServiceException as exc:
+            print("Service did not process request: " + str(exc))
+
+    def trigger_simple_pick_point_service(self, name):
+        # The Babuska detector buttons: like Simple Pick Point, these services on the
+        # simple_pick_point node do the whole action themselves, bypassing the pipeline.
+        if name not in self.simple_pick_point_services:
+            rospy.wait_for_service(name, timeout=10)
+            self.simple_pick_point_services[name] = rospy.ServiceProxy(name, pipeline_command)
+        try:
+            self.simple_pick_point_services[name](name)
         except rospy.ServiceException as exc:
             print("Service did not process request: " + str(exc))
 
