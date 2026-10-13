@@ -19,6 +19,11 @@ from common.transforms import transform_pose_array
 from common.util import camera_info2rs_intrinsics, DepthImageFilter
 from common.download_model import download_from_google_drive
 
+# Folders in experiments/ that hold one pick attempt's data (written by this node, the
+# map node, the grasp candidate/selection nodes and plan_movement's grasp check); they
+# are moved to saved_experiments/<timestamp>/ when the next attempt starts.
+ATTEMPT_DIRS = ["obb", "map", "pointcloud", "pose"]
+
 class DetectTrussOBB():
     def __init__(self, NODE_NAME):
         self.node_name = NODE_NAME
@@ -179,12 +184,18 @@ class DetectTrussOBB():
         saved_exp_dir = os.path.join(catkin_ws_dir, "saved_experiments")
         obb_dir = os.path.join(exp_dir, "obb")
         
-        #If experiments folder already exist, save it with a new name
+        #If the previous attempt's data exists, save it with a new name. Only the per-attempt
+        #folders are moved: experiments/ also holds persistent logs (planning_metrics,
+        #crate_reachability, planner_comparison) that must stay where their writers expect them.
         if not os.path.exists(saved_exp_dir):
             os.makedirs(saved_exp_dir)
-        if os.path.exists(exp_dir) and len(os.listdir(exp_dir)) > 2:
+        attempt_dirs = [d for d in ATTEMPT_DIRS if os.path.exists(os.path.join(exp_dir, d))]
+        if attempt_dirs:
             current_time = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-            shutil.move(exp_dir, os.path.join(saved_exp_dir, f"{current_time}"))
+            attempt_save_dir = os.path.join(saved_exp_dir, f"{current_time}")
+            os.makedirs(attempt_save_dir)
+            for d in attempt_dirs:
+                shutil.move(os.path.join(exp_dir, d), os.path.join(attempt_save_dir, d))
         
         if not os.path.exists(obb_dir):
             os.makedirs(obb_dir)

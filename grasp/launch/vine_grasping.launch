@@ -3,6 +3,12 @@
     <arg name="robot_name"              default="panda"/>
     <arg name="camera_frame"            default="camera_color_optical_frame"/>
     <arg name="camera_fps"              default="5"/>
+    <!-- Gripper D405 used for detection; pinned by serial so the driver can't grab the
+         side D435 documentation camera when both are plugged in. -->
+    <arg name="gripper_camera_serial"   default="123622270536"/>
+    <!-- Side D435 that plan_movement records each attempt with (needs it plugged in at launch). -->
+    <arg name="record_video"            default="true"/>
+    <arg name="video_camera_serial"     default="213322070505"/>
 
 	<param name="robot_name" type="str" value="$(arg robot_name)" />
 	<param name="camera_frame" type="str" value="$(arg camera_frame)" />
@@ -13,6 +19,7 @@
   
   <group ns="$(arg robot_name)">
   	<include file="$(find realsense2_camera)/launch/rs_camera.launch">
+  		<arg name="serial_no" 	value="$(arg gripper_camera_serial)"/>
   		<arg name="align_depth" 	value="true"/>
 		<arg name="enable_pointcloud"	value="true"/>
 		<arg name="initial_reset"	value="true"/>
@@ -25,7 +32,10 @@
 		
   	</include>
 
-    <node name="plan_movement" pkg="grasp" type="plan_movement_node.py" output="screen"></node>
+    <node name="plan_movement" pkg="grasp" type="plan_movement_node.py" output="screen">
+      <param name="record_video" value="$(arg record_video)"/>
+      <param name="video_camera_serial" type="str" value="$(arg video_camera_serial)"/>
+    </node>
     
     <node name="detect_truss_obb" pkg="grasp" type="detect_truss_obb_node.py" output="screen"></node>
     

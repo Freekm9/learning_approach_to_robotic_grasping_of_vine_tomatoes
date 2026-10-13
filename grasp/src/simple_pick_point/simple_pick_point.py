@@ -1,3 +1,5 @@
+import os
+import sys
 import rospy
 import numpy as np
 import cv2
@@ -17,6 +19,11 @@ from common.util import camera_info2rs_intrinsics, DepthImageFilter
 from common.transforms import transform_pose
 from common.grasp_motion import post_grasp_poses, pre_grasp_gripper_state, CartesianMotionChecker
 from babuska_pick_point import BabuskaPicker
+from tf.transformations import quaternion_matrix
+
+# stem_segmentation is not a catkin python package (no rebuild needed): import by path.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'stem_segmentation'))
+from stem_snap import StemSnapper, depth_to_cloud, DEFAULT_MAX_PX  # noqa: E402
 
 from moveit_msgs.msg import MoveItErrorCodes
 from moveit_msgs.srv import GetPositionIK, GetPositionIKRequest
@@ -85,6 +92,14 @@ class SimplePickPoint():
         self.camera_info_sub = rospy.Subscriber("camera/color/camera_info", CameraInfo, self.camera_info_callback)
         self.image_sub = rospy.Subscriber("camera/color/image_raw", Image, self.image_callback)
         self.depth_image_sub = rospy.Subscriber("camera/depth/image_rect_raw", Image, self.depth_image_callback)
+        # Depth registered to the colour image, pixel for pixel: the stem snapping needs
+        # each depth pixel's colour, which image_rect_raw (depth camera frame) doesn't give.
+        self.aligned_depth_sub = rospy.Subscriber("camera/aligned_depth_to_color/image_raw", Image,
+                                                  self.aligned_depth_callback)
+        self.aligned_depth = None
+        self.collect_aligned_depth = False
+        self.snapper = None
+        self.snap = None
 
         self.tfBuffer = tf2_ros.Buffer()
         self.tfListener = tf2_ros.TransformListener(self.tfBuffer)
@@ -120,6 +135,11 @@ class SimplePickPoint():
         if self.collect_depth_image:
             self.depth_image = depth_image
             self.collect_depth_image = False
+
+    def aligned_depth_callback(self, depth_image):
+        if self.collect_aligned_depth:
+            self.aligned_depth = depth_image
+            self.collect_aligned_depth = False
 
     def camera_info_callback(self, msg):
         if self.camera_info is None:
@@ -199,8 +219,9 @@ class SimplePickPoint():
         and return the resulting grasp pose in the planning frame. Returns None
         on any failure, having already printed why."""
         print("Grabbing frame")
-        self.image, self.depth_image = None, None
+        self.image, self.depth_image, self.aligned_depth = None, None, None
         self.collect_image, self.collect_depth_image = True, True
+        self.collect_aligned_depth = picker == "manual"
         counter = 0
         while self.collect_image or self.collect_depth_image:
             rospy.sleep(0.1)
@@ -211,11 +232,13 @@ class SimplePickPoint():
 
         rgb_image = self.bridge.imgmsg_to_cv2(self.image, desired_encoding='rgb8')
         depth_image = self.bridge.imgmsg_to_cv2(self.depth_image)
+        self.snapper = self._build_snapper(rgb_image) if picker == "manual" else None
 
         # Draw from the main thread, since opencv can't handle it otherwise
         self.preprocessed_image = rgb_image
         self.picker = picker
         self.points = None
+        self.snap = None
         self.draw = True
         while self.points is None:
             rospy.sleep(0.1)
@@ -226,7 +249,13 @@ class SimplePickPoint():
             print("Pick cancelled")
             return None
 
-        grasp_pose = self.generate_grasp_pose(points=points, depth_image=depth_image)
+        snap_xyz = None
+        if self.snap is not None:
+            snap_xyz = self.snap.point_cam
+            print(f"Snapped to stem {self.snap.cluster} "
+                  f"({'main stem' if self.snap.on_main_path else 'side branch'}, "
+                  f"{self.snap.distance_px:.0f} px from the click)")
+        grasp_pose = self.generate_grasp_pose(points=points, depth_image=depth_image, xyz=snap_xyz)
         if grasp_pose is None:
             print("Picked point has no valid depth")
             return None
@@ -238,14 +267,16 @@ class SimplePickPoint():
 
         return grasp_pose
 
-    def generate_grasp_pose(self, points, depth_image):
+    def generate_grasp_pose(self, points, depth_image, xyz=None):
+        """xyz (camera frame, m) overrides the depth-patch position, e.g. a stem snap."""
         (x_c, y_c), (x_d, y_d) = points
-        depth_filter = DepthImageFilter(depth_image, self.rs_intrinsics, patch_size=30)
-        depth = depth_filter.get_depth(y_c, x_c)
-        if np.isnan(depth):
-            return None
-        depth = depth / 1000  # mm -> m
-        xyz = depth_filter.deproject(y_c, x_c, depth=depth)
+        if xyz is None:
+            depth_filter = DepthImageFilter(depth_image, self.rs_intrinsics, patch_size=30)
+            depth = depth_filter.get_depth(y_c, x_c)
+            if np.isnan(depth):
+                return None
+            depth = depth / 1000  # mm -> m
+            xyz = depth_filter.deproject(y_c, x_c, depth=depth)
         yaw = np.arctan2(y_d - y_c, x_d - x_c)
 
         grasp_pose = PoseStamped()
@@ -483,54 +514,146 @@ class SimplePickPoint():
             self.points = picker.points() if picker.save else False
             return
         picker = PickTwoPoints()
-        picker.reset(copy.deepcopy(rgb_image))
+        picker.reset(copy.deepcopy(rgb_image), snapper=self.snapper)
         picker.draw()
         if picker.save and picker.center is not None and picker.direction is not None:
+            self.snap = picker.snap
             self.points = (picker.center, picker.direction)
         else:
             self.points = False
 
+    def _build_snapper(self, rgb_image):
+        """Segment the stems in the frame just grabbed, for snapping clicks in the picker.
+        Returns None (plain two-click picking) if anything needed is missing."""
+        counter = 0
+        while self.collect_aligned_depth and counter < 10:
+            rospy.sleep(0.1)
+            counter += 1
+        if self.aligned_depth is None or self.camera_info is None:
+            print("Stem snapping off: no aligned depth image (camera/aligned_depth_to_color/image_raw)")
+            return None
+        try:
+            tf_msg = self.tfBuffer.lookup_transform(self.planning_frame, self.camera_frame,
+                                                    rospy.Time(0), rospy.Duration(1.0))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            print(f"Stem snapping off: no camera transform ({e})")
+            return None
+        t, q = tf_msg.transform.translation, tf_msg.transform.rotation
+        cam_to_base = quaternion_matrix([q.x, q.y, q.z, q.w])
+        cam_to_base[:3, 3] = [t.x, t.y, t.z]
+        K = np.array(self.camera_info.K).reshape(3, 3)
+        depth_m = self.bridge.imgmsg_to_cv2(self.aligned_depth).astype(np.float64) / 1000.0
+        try:
+            snapper = StemSnapper(*depth_to_cloud(depth_m, rgb_image, K), cam_to_base, K)
+        except Exception as e:  # never block picking on the segmentation
+            print(f"Stem snapping off: segmentation failed ({e})")
+            return None
+        print(f"Stem snapping: {snapper.n_clusters} stems found")
+        return snapper
+
 
 class PickTwoPoints():
     """First click sets the grasp point, second sets the stem direction from it.
-    A third click starts over. Enter confirms, escape cancels."""
+    A third click starts over. Enter confirms, escape cancels.
+
+    With a StemSnapper, the found stems are drawn and the first click snaps to the
+    nearest stem (peduncle preferred) within DEFAULT_MAX_PX: that sets both the grasp
+    point and the stem direction, so Enter confirms straight away. A click with no stem
+    nearby falls back to the two-click mode. 's' turns snapping off/on."""
+
+    WINDOW = 'simple_pick_point'
+    MAIN_COLOR = (0, 230, 255)    # RGB, the image is RGB until shown
+    SIDE_COLOR = (170, 170, 170)
 
     def __init__(self):
         self.lock = Lock()
 
-    def reset(self, image):
-        self.image = image
-        self.image_copy = copy.deepcopy(image)
+    def reset(self, image, snapper=None):
+        self.snapper = snapper
+        self.snapping = snapper is not None
+        self.raw = image
+        self.save = False
+        self._start_over()
+
+    def _start_over(self, status=None):
         self.center = None
         self.direction = None
-        self.save = False
+        self.snap = None
+        self.image = copy.deepcopy(self.raw)
+        if self.snapping:
+            self._draw_stems(self.image)
+        self.image_copy = copy.deepcopy(self.image)
+        self.status = status or self._default_status()
+
+    def _default_status(self):
+        if self.snapper is None:
+            return "click grasp point, then stem direction | Enter: grasp | Esc: cancel"
+        if self.snapping:
+            return f"snap on ({self.snapper.n_clusters} stems): click near a stem | s: snap off | Esc: cancel"
+        return "snap off: click grasp point, then stem direction | s: snap on | Esc: cancel"
+
+    def _draw_stems(self, image):
+        for ci, (c, uv) in enumerate(zip(self.snapper.result.clusters, self.snapper.nodes_uv)):
+            main = self.snapper._main_edges[ci]
+            for k, (a, b) in enumerate(c.edges):
+                if not (np.all(np.isfinite(uv[a])) and np.all(np.isfinite(uv[b]))):
+                    continue
+                cv2.line(image, tuple(np.round(uv[a]).astype(int)), tuple(np.round(uv[b]).astype(int)),
+                         self.MAIN_COLOR if main[k] else self.SIDE_COLOR, 2 if main[k] else 1, cv2.LINE_AA)
 
     def click_event(self, event, x, y, flags, param):
         if event != cv2.EVENT_LBUTTONDOWN:
             return
         if self.direction is not None:
-            self.image = copy.deepcopy(self.image_copy)
-            self.center, self.direction = None, None
-        elif self.center is not None:
+            self._start_over()
+            if not self.snapping:
+                return  # as before: the third click only starts over
+        if self.center is not None:
             self.direction = (x, y)
             cv2.arrowedLine(self.image, self.center, self.direction, (255, 255, 0), 2)
-        else:
-            self.center = (x, y)
-            cv2.circle(self.image, (x, y), 5, (255, 255, 0), -1)
+            self.status = "Enter: grasp | click: start over | Esc: cancel"
+            return
+        if self.snapping:
+            snap = self.snapper.snap((x, y))
+            if snap is not None:
+                self.snap = snap
+                self.center, self.direction = snap.uv, snap.uv_ahead
+                cv2.line(self.image, (x, y), snap.uv, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.circle(self.image, (x, y), 3, (255, 255, 255), -1)
+                cv2.circle(self.image, snap.uv, 6, (0, 255, 0), -1)
+                # Drawn 2.5x longer than uv_ahead for visibility; only the angle sets the yaw.
+                tip = tuple(int(round(c + 2.5 * (d - c))) for c, d in zip(snap.uv, snap.uv_ahead))
+                cv2.arrowedLine(self.image, snap.uv, tip, (255, 40, 40), 2, tipLength=0.25)
+                where = "main stem" if snap.on_main_path else "side branch"
+                self.status = f"snapped to {where} ({snap.distance_px:.0f} px) | Enter: grasp | click: retry | Esc: cancel"
+                return
+            self.status = f"no stem within {DEFAULT_MAX_PX} px: click a second point for the stem direction"
+        self.center = (x, y)
+        cv2.circle(self.image, (x, y), 5, (255, 255, 0), -1)
+
+    def _show(self):
+        shown = self.image[..., ::-1].copy()
+        cv2.rectangle(shown, (0, shown.shape[0] - 26), (shown.shape[1], shown.shape[0]), (30, 30, 30), -1)
+        cv2.putText(shown, self.status, (8, shown.shape[0] - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.imshow(self.WINDOW, shown)
 
     def draw(self):
-        cv2.namedWindow('simple_pick_point')
-        cv2.setMouseCallback('simple_pick_point', self.click_event)
+        cv2.namedWindow(self.WINDOW)
+        cv2.setMouseCallback(self.WINDOW, self.click_event)
         while True:
-            cv2.imshow('simple_pick_point', self.image[..., ::-1])
+            self._show()
             pressed_key = cv2.waitKey(20) & 0xFF
             if pressed_key == 27:  # Esc cancels
                 break
-            if pressed_key == 13 and self.direction is not None:  # Enter confirms
+            if pressed_key in (10, 13) and self.direction is not None:  # Enter confirms
                 self.save = True
                 break
+            if pressed_key == ord('s') and self.snapper is not None:
+                self.snapping = not self.snapping
+                self._start_over()
         try:
-            cv2.destroyWindow('simple_pick_point')
+            cv2.destroyWindow(self.WINDOW)
         except cv2.error:
             print("Window already closed. Ignoring")
         cv2.waitKey(100)

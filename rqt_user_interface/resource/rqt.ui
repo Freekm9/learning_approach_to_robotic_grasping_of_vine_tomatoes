@@ -2302,6 +2302,16 @@
      </property>
     </widget>
    </item>
+   <item row="14" column="3">
+    <widget class="QPushButton" name="DropOff">
+     <property name="toolTip">
+      <string>Carry the held truss to the SavePosePlace pose, open the gripper and retreat</string>
+     </property>
+     <property name="text">
+      <string>DropOff</string>
+     </property>
+    </widget>
+   </item>
    <item row="14" column="2">
     <widget class="QPushButton" name="GoToSavedPose">
      <property name="palette">

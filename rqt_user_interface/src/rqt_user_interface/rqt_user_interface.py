@@ -50,6 +50,7 @@ class RqtPipeline(Plugin):
         self._widget.GoToSavedPose.clicked[bool].connect(lambda: self.send_command_to_pipeline("go_to_saved_pose"))
         self._widget.SavePose.clicked[bool].connect(lambda: self.send_command_to_pipeline("save_pose"))
         self._widget.SavePosePlace.clicked[bool].connect(lambda: self.send_command_to_pipeline("save_pose_place"))
+        self._widget.DropOff.clicked[bool].connect(lambda: self.send_command_to_pipeline("drop_off"))
         self._widget.DetectTrussOBB.clicked[bool].connect(lambda: self.send_command_to_pipeline("detect_truss_obb"))
         self._widget.DetectTrussManual.clicked[bool].connect(lambda: self.send_command_to_pipeline("detect_truss_manual"))
         self._widget.GoToTruss.clicked[bool].connect(lambda: self.send_command_to_pipeline("go_to_truss"))

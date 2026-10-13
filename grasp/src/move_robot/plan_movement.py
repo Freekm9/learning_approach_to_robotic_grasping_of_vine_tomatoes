@@ -27,6 +27,7 @@ from common.transforms import transform_pose
 from common.moveit_util import all_close, create_collision_object
 from common.util import flip_z_rotation_stamped_pose
 from common.grasp_motion import post_grasp_poses, PRE_GRASP_GRIPPER_WIDTH_M
+from common.crate_contents import CrateContentsObstacle, crate_interior_from_boxes, CRATE_CONTENTS_ID
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -38,6 +39,8 @@ from pilz_robot_programming import *
 import copy
 import os
 
+# Pre-grasp offset back along the approach axis; must match simple_pick_point.py's IK checks.
+PRE_GRASP_OFFSET_M = 0.05
 # Speed of the straight-line descent from pre-grasp to grasp in grasp(), as fractions
 # of the joint velocity/acceleration limits (other Cartesian moves default to 0.15/0.3).
 GRASP_DESCENT_VELOCITY_SCALING = 0.05
@@ -46,6 +49,32 @@ GRASP_DESCENT_ACCELERATION_SCALING = 0.1
 # their distances are in common/grasp_motion.py, shared with the reachability checks).
 POST_GRASP_LIFT_VELOCITY_SCALING = 0.15
 POST_GRASP_LIFT_ACCELERATION_SCALING = 0.3
+# Cartesian return to the SavePose pose (GoToSavedPose)
+SAVED_POSE_CARTESIAN_VELOCITY_SCALING = 0.2
+SAVED_POSE_CARTESIAN_ACCELERATION_SCALING = 0.3
+# Cartesian moves of DropOff (to above the place pose, down to it, retreat up)
+DROP_OFF_CARTESIAN_VELOCITY_SCALING = 0.2
+DROP_OFF_CARTESIAN_ACCELERATION_SCALING = 0.3
+# Goal selection for ~nearest_ik_goal: TRAC-IK (Speed mode) returns the first solution
+# it finds, not the nearest, so ask several times and keep the closest one.
+IK_GOAL_ATTEMPTS = 6
+IK_GOAL_TIMEOUT_S = 0.1
+# ~motion_method 'waypoints': straight transit to an entry pose this far back from the
+# grasp point along the approach axis, then a straight approach to pre-grasp. Also the
+# length of the corridor kept free of crate contents, so the approach runs through it.
+WAYPOINT_ENTRY_OFFSET_M = 0.30
+WAYPOINT_TRANSIT_VELOCITY_SCALING = 0.3   # as the planned moves in go_to_pose
+WAYPOINT_TRANSIT_ACCELERATION_SCALING = 0.3
+WAYPOINT_APPROACH_VELOCITY_SCALING = 0.15  # as go_to_pose_cartesian's default
+WAYPOINT_APPROACH_ACCELERATION_SCALING = 0.3
+# Luuk van den Bent's motion (~motion_method 'luuk'), from his last upstream commit
+# d003c2a: Pilz LIN moves, pre-grasp straight up from the grasp point, straight descent
+# to just below it (his impedance move, here on the position controller), straight-up lift.
+LUUK_PRE_GRASP_HEIGHT_M = 0.03
+LUUK_GRASP_SINK_M = 0.01
+LUUK_POST_GRASP_HEIGHT_M = 0.25
+LUUK_LIN_VELOCITY_SCALING = 0.7
+LUUK_LIN_ACCELERATION_SCALING = 0.3
 
 class Planner(object):
 
@@ -62,6 +91,11 @@ class Planner(object):
         self.aruco2_pose = None
         self.force_z = None
         self.ik_service = None
+        self._pink = None  # PinkMoveItPlanner, created on first use of pipeline_id 'pink'
+        # Trusses in the crate as an obstacle for the planned move to pre-grasp (see
+        # common/crate_contents.py and _plan_to_pre_grasp); re-read per grasp so they can
+        # be toggled with rosparam set without restarting.
+        self.avoid_crate_contents_default = rospy.get_param('~avoid_crate_contents', True)
 
         self.tfBuffer = tf2_ros.Buffer()
         self.tfListener = tf2_ros.TransformListener(self.tfBuffer)
@@ -98,6 +132,11 @@ class Planner(object):
         self._default_planner_id = rospy.get_param('~planner_id', 'BiTRRT')
         self.planning_time = rospy.get_param('~planning_time', 5.0)
         self.num_planning_attempts = rospy.get_param('~num_planning_attempts', 100)
+        self._default_nearest_ik_goal = rospy.get_param('~nearest_ik_goal', True)
+        # 'ours' or 'luuk' (Luuk van den Bent's original grasp/place motion, for comparison).
+        self._default_motion_method = rospy.get_param('~motion_method', 'ours')
+        # Cancellable execution for the 'luuk' straight-line moves (stop on contact)
+        self.execute_trajectory_client = None
 
         rospack = rospkg.RosPack()
         grasp_pckg_dir = rospack.get_path('grasp')
@@ -111,6 +150,7 @@ class Planner(object):
             "planning_success", "planning_duration_s", "path_length", "num_waypoints",
             "execution_success", "execution_duration_s", "goal_reached", "result",
             "video_file", "gripper_video_file",
+            "goal_type", "direct_joint_distance", "replans",
         ]
         self._init_metrics_csv()
         rospy.loginfo(f"Logging planning metrics to {self.metrics_csv_path}")
@@ -196,11 +236,33 @@ class Planner(object):
         return rospy.get_param('~planner_id', self._default_planner_id)
 
     @property
+    def nearest_ik_goal(self):
+        """Plan to the IK solution of the goal pose nearest the current joints instead
+        of letting OMPL pick any IK solution (a far one, e.g. the wrist turning the long
+        way round, is the main source of overly long paths). Re-read on every access so
+        it can be switched off with rosparam set for comparison runs."""
+        return rospy.get_param('~nearest_ik_goal', self._default_nearest_ik_goal)
+
+    @property
+    def motion_method(self):
+        """Re-read on every access, like planner_id, so run_planner_experiment.py can
+        interleave 'ours' and 'luuk' trials without restarting this node."""
+        method = rospy.get_param('~motion_method', self._default_motion_method)
+        if method not in ('ours', 'luuk', 'waypoints'):
+            rospy.logwarn_throttle(10, f"Unknown motion_method '{method}', using 'ours'")
+            return 'ours'
+        return method
+
+    @property
     def planner_label(self):
         """Short label identifying the current planning configuration, for video
         filenames and the metrics CSV's planner_id column. planner_id only means
         something within the ompl pipeline, so label by pipeline_id otherwise
-        (e.g. 'chomp') rather than printing a meaningless leftover ompl planner name."""
+        (e.g. 'chomp') rather than printing a meaningless leftover ompl planner name.
+        Luuk's motion always uses Pilz LIN, so it is labelled 'luuk'; 'waypoints' rows
+        (including its planner fallbacks, see goal_type) are labelled 'waypoints'."""
+        if self.motion_method in ('luuk', 'waypoints'):
+            return self.motion_method
         return self.planner_id if self.pipeline_id == "ompl" else self.pipeline_id
 
     def force_ext_callback(self, data):
@@ -274,23 +336,33 @@ class Planner(object):
         elif movement == 'grasp':
             return self.grasp()
 
+        elif movement == 'drop_off':
+            return self.drop_off()
+
+        elif movement == 'go_to_saved_pose':
+            return self.go_to_saved_pose()
+
         elif movement == 'go_to_pre_grasp':
             # Moves only to the pre-grasp offset above the currently set grasp_pose
             # (no sink, no gripper close) -- used by "Test Pre-Grasp Positions" in the
             # GUI to visually check gripper alignment before committing to a real pick.
-            # 0.05 must match the pre-grasp offset grasp() uses below.
+            if self.motion_method == 'luuk':
+                return self._go_to_pose_luuk(self._luuk_offset_z(self.grasp_pose, LUUK_PRE_GRASP_HEIGHT_M),
+                                             self.move_group_ee, allow_flip=True, movement='test_pre_grasp')
             approach_vec = self._get_approach_vec(self.grasp_pose)
-            pre_grasp_pose = copy.deepcopy(self.grasp_pose)
-            pre_grasp_pose.pose.position.x -= approach_vec[0] * 0.05
-            pre_grasp_pose.pose.position.y -= approach_vec[1] * 0.05
-            pre_grasp_pose.pose.position.z -= approach_vec[2] * 0.05
-            return self.go_to_pose(pre_grasp_pose, self.move_group_ee, allow_flip=True, movement='test_pre_grasp')
+            result, _ = self._plan_to_pre_grasp(self.grasp_pose, approach_vec, movement='test_pre_grasp')
+            return result
 
         elif movement == 'check_grasp_success':
             return self.check_grasp_success()
 
         goal, move_group, allow_flip = self.find_goal_pose(movement=movement)
 
+        if self.motion_method == 'luuk':
+            # His find_goal_pose only really set retry_with_impedance for go_to_place_above
+            # (go_to_place and go_to_place_retreat had a bare `retry_with_impedance` line).
+            return self._go_to_pose_luuk(goal, move_group, allow_flip=allow_flip, movement=movement,
+                                         retry_straight_line=movement == 'go_to_place_above')
         return self.go_to_pose(goal, move_group, allow_flip=allow_flip, movement=movement)
 
     def find_goal_pose(self, movement=None):
@@ -334,7 +406,7 @@ class Planner(object):
         return goal_pose, move_group, allow_flip
 
 
-    def _resolve_ik(self, goal_pose, move_group):
+    def _resolve_ik(self, goal_pose, move_group, timeout=0.5):
         """Resolve a Cartesian goal_pose to a joint-space RobotState via IK, seeded
         from move_group's current state. Needed for chomp: unlike ompl (which
         accepts a pose goal and samples IK itself during planning),
@@ -349,7 +421,8 @@ class Planner(object):
         req.ik_request.ik_link_name = move_group.get_end_effector_link()
         req.ik_request.pose_stamped = goal_pose
         req.ik_request.avoid_collisions = True
-        req.ik_request.timeout = rospy.Duration(0.5)
+        req.ik_request.robot_state = self.robot.get_current_state()  # seed: where the arm is now
+        req.ik_request.timeout = rospy.Duration(timeout)
         try:
             res = self.ik_service(req)
         except rospy.ServiceException as e:
@@ -365,9 +438,28 @@ class Planner(object):
         return {name: position for name, position in zip(solution.name, solution.position)
                 if name in group_joint_names}
 
+    def _nearest_ik_goal(self, goal_pose, move_group):
+        """Joint goal for goal_pose closest (joint-space distance) to the current joints,
+        over IK_GOAL_ATTEMPTS collision-free IK solutions of goal_pose itself (grasp()
+        chooses between the two grasp orientations in _grasp_orientations). Returns
+        (joints dict, distance) or None."""
+        names = move_group.get_active_joints()
+        current = np.array(move_group.get_current_joint_values())
+        best = None
+        for _ in range(IK_GOAL_ATTEMPTS):
+            joints = self._resolve_ik(goal_pose, move_group, timeout=IK_GOAL_TIMEOUT_S)
+            if joints is None:
+                continue
+            dist = float(np.linalg.norm(np.array([joints[n] for n in names]) - current))
+            if best is None or dist < best[1]:
+                best = (joints, dist)
+        return best
+
     # control robot to desired goal position using only MoveIt (position controller)
     # movement/is_retry are only used for metrics + video labeling, see _log_metrics
-    def go_to_pose(self, goal_pose, move_group, allow_flip=False, movement=None, is_retry=False):
+    # joint_goal: IK solution of goal_pose to plan to (ompl), e.g. one already checked by
+    # _grasp_orientations; by default the nearest one is looked up here (~nearest_ik_goal).
+    def go_to_pose(self, goal_pose, move_group, allow_flip=False, movement=None, is_retry=False, joint_goal=None):
         if goal_pose == None:
             return 'failure'
 
@@ -377,18 +469,13 @@ class Planner(object):
             clip_stem = f"{time.strftime('%Y%m%d_%H%M%S')}_{self.planner_label}_{label}"
             self._start_recording(clip_stem)
 
-        metrics = {field: "" for field in self._metrics_fields}
-        metrics["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        metrics["movement"] = movement or ""
-        metrics["is_retry"] = is_retry
-        metrics["planner_id"] = self.planner_label
-        metrics["planning_time_limit"] = self.planning_time
-        metrics["num_planning_attempts"] = self.num_planning_attempts
-        metrics["video_file"] = self._active_clip_name or ""
-        metrics["gripper_video_file"] = self._active_gripper_clip_name or ""
+        metrics = self._new_metrics_row(movement, is_retry)
 
         try:
-            move_group.set_planning_pipeline_id(self.pipeline_id)
+            # pink (pink_moveit.py) runs here in this node rather than in
+            # move_group, so there is no MoveIt pipeline to select for it.
+            if self.pipeline_id != "pink":
+                move_group.set_planning_pipeline_id(self.pipeline_id)
             if self.pipeline_id == "ompl":
                 # Asymptotically-optimal: keeps improving path cost (joint-space
                 # length) over the allotted time instead of stopping at the first
@@ -418,11 +505,33 @@ class Planner(object):
                                                 movement=movement, is_retry=True) #retry flipped
                     return 'failure'
                 move_group.set_joint_value_target(ik_joint_state)
-            else:
-                move_group.set_pose_target(goal_pose)
+            elif self.pipeline_id != "pink":
+                if joint_goal is not None:
+                    current = np.array(move_group.get_current_joint_values())
+                    target = np.array([joint_goal[n] for n in move_group.get_active_joints()])
+                    nearest = (joint_goal, float(np.linalg.norm(target - current)))
+                else:
+                    nearest = self._nearest_ik_goal(goal_pose, move_group) if self.nearest_ik_goal else None
+                if nearest is not None:
+                    move_group.set_joint_value_target(nearest[0])
+                    metrics["goal_type"] = "nearest_ik"
+                    metrics["direct_joint_distance"] = nearest[1]
+                else:
+                    # IK found nothing (or disabled): let OMPL sample IK itself, as before
+                    move_group.set_pose_target(goal_pose)
+                    metrics["goal_type"] = "pose"
 
             plan_start = time.time()
-            success, plan, _, error = move_group.plan()
+            if self.pipeline_id == "pink":
+                if self._pink is None:
+                    from move_robot.pink_moveit import PinkMoveItPlanner
+                    self._pink = PinkMoveItPlanner(self.robot, self.scene, self.tfBuffer)
+                success, plan = self._pink.plan(goal_pose, move_group)
+                if success:
+                    # Same 0.3 velocity/acceleration scaling as the MoveIt pipelines above
+                    plan = self._retime(move_group, plan, 0.3, 0.3)
+            else:
+                success, plan, _, error = move_group.plan()
             metrics["planning_duration_s"] = time.time() - plan_start
             metrics["planning_success"] = success
             if success:
@@ -471,6 +580,18 @@ class Planner(object):
             if self._video_call_depth == 0:
                 self._stop_recording()
 
+    def _new_metrics_row(self, movement, is_retry):
+        metrics = {field: "" for field in self._metrics_fields}
+        metrics["timestamp"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        metrics["movement"] = movement or ""
+        metrics["is_retry"] = is_retry
+        metrics["planner_id"] = self.planner_label
+        metrics["planning_time_limit"] = self.planning_time
+        metrics["num_planning_attempts"] = self.num_planning_attempts
+        metrics["video_file"] = self._active_clip_name or ""
+        metrics["gripper_video_file"] = self._active_gripper_clip_name or ""
+        return metrics
+
     def _joint_path_length(self, plan):
         """Sum of joint-space Euclidean distances between consecutive trajectory waypoints."""
         points = plan.joint_trajectory.points
@@ -485,8 +606,18 @@ class Planner(object):
                 csv.DictWriter(f, fieldnames=self._metrics_fields).writeheader()
 
     def _log_metrics(self, row):
-        with open(self.metrics_csv_path, 'a', newline='') as f:
-            csv.DictWriter(f, fieldnames=self._metrics_fields).writerow(row)
+        # Logging must never fail the movement itself: an exception here propagates out of
+        # the move_robot service, and the pipeline then treats a completed move as failed.
+        try:
+            os.makedirs(self.experiments_dir, exist_ok=True)
+            write_header = not os.path.exists(self.metrics_csv_path)
+            with open(self.metrics_csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self._metrics_fields)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+        except OSError as e:
+            print(f"Could not log planning metrics: {e}")
 
     def _init_side_video_capture(self):
         """Quick probe at startup so a missing/misidentified side camera shows up
@@ -638,6 +769,25 @@ class Planner(object):
 
         # compute_cartesian_path does not time-parameterize the trajectory,
         # so it must be retimed before execution or the controller rejects it
+        plan = self._retime(move_group, plan, velocity_scaling, acceleration_scaling)
+
+        plan_executed = move_group.execute(plan, wait=True)
+        move_group.stop()
+        move_group.clear_pose_targets()
+        if not plan_executed:
+            print("MoveIt cartesian execution failed.")
+            return 'failure'
+
+        current_pose = move_group.get_current_pose().pose
+        close = all_close(goal_pose.pose, current_pose, 0.05)
+        print("MOVEMENT WAS CLOSE?: ", close)
+        if close:
+            return 'success'
+        else:
+            return 'failure'
+
+    def _retime(self, move_group, plan, velocity_scaling, acceleration_scaling):
+        """Time-parameterize an untimed path (Cartesian or Pink) for execution."""
         plan = move_group.retime_trajectory(
             self.robot.get_current_state(),
             plan,
@@ -658,27 +808,251 @@ class Planner(object):
                 strictly_increasing_points.append(point)
                 last_time = t
         plan.joint_trajectory.points = strictly_increasing_points
-
-        plan_executed = move_group.execute(plan, wait=True)
-        move_group.stop()
-        move_group.clear_pose_targets()
-        if not plan_executed:
-            print("MoveIt cartesian execution failed.")
-            return 'failure'
-
-        current_pose = move_group.get_current_pose().pose
-        close = all_close(goal_pose.pose, current_pose, 0.05)
-        print("MOVEMENT WAS CLOSE?: ", close)
-        if close:
-            return 'success'
-        else:
-            return 'failure'
+        return plan
 
     def _get_approach_vec(self, pose_stamped):
         """Return the TCP z-axis (approach direction) in the planning frame."""
         o = pose_stamped.pose.orientation
         rot = R.from_quat([o.x, o.y, o.z, o.w])
         return rot.apply([0, 0, 1])
+
+    @property
+    def avoid_crate_contents(self):
+        return rospy.get_param('~avoid_crate_contents', self.avoid_crate_contents_default)
+
+    def _crate_contents_obstacle(self):
+        """CrateContentsObstacle for the crate currently in the planning scene."""
+        from move_robot.test_crate_reachability import box_world_pose_and_dims
+        boxes = []
+        for name, obj in self.scene.get_objects().items():
+            box = box_world_pose_and_dims(obj) if name != CRATE_CONTENTS_ID else None
+            if box is not None:
+                boxes.append((name,) + box)
+        return CrateContentsObstacle(
+            self.scene, self.tfBuffer, self.planning_frame, crate_interior_from_boxes(boxes),
+            cloud_topic=rospy.get_param('~crate_contents_cloud_topic', 'camera/depth/color/points'),
+            cell_m=rospy.get_param('~crate_contents_cell_m', 0.02),
+            carve_radius_m=rospy.get_param('~crate_contents_carve_radius_m', 0.04),
+            corridor_length_m=WAYPOINT_ENTRY_OFFSET_M,
+            finger_margin_m=rospy.get_param('~crate_contents_finger_margin_m', 0.015))
+
+    def _capture_crate_contents(self):
+        """Point cloud (planning frame) of the crate for _plan_to_pre_grasp, or None if
+        disabled/unavailable -- planning then just ignores the trusses, as before."""
+        if not self.avoid_crate_contents:
+            return None
+        try:
+            return self._crate_contents_obstacle().capture_xyz()
+        except Exception as e:
+            rospy.logwarn(f"Crate contents: no point cloud ({e}); planning to pre-grasp without the trusses as obstacle")
+            return None
+
+    def _pre_grasp_pose(self, grasp_pose, approach_vec):
+        """Pre-grasp: PRE_GRASP_OFFSET_M back along the approach axis from grasp_pose."""
+        pre_grasp_pose = copy.deepcopy(grasp_pose)
+        pre_grasp_pose.pose.position.x -= approach_vec[0] * PRE_GRASP_OFFSET_M
+        pre_grasp_pose.pose.position.y -= approach_vec[1] * PRE_GRASP_OFFSET_M
+        pre_grasp_pose.pose.position.z -= approach_vec[2] * PRE_GRASP_OFFSET_M
+        return pre_grasp_pose
+
+    def _roll_about_approach(self, pose_stamped):
+        """pose_stamped turned 180° about its own approach (TCP z) axis: the same grasp
+        for the symmetric parallel jaws, with the same approach direction. Unlike
+        flip_z_rotation_stamped_pose (180° about the planning frame's z), this also keeps
+        the approach of a tilted grasp."""
+        rolled = copy.deepcopy(pose_stamped)
+        o = rolled.pose.orientation
+        q = (R.from_quat([o.x, o.y, o.z, o.w]) * R.from_euler('z', np.pi)).as_quat()
+        o.x, o.y, o.z, o.w = q
+        return rolled
+
+    def _straight_lines_ok(self, joints, targets):
+        """Whether go_to_pose_cartesian's straight lines through targets (PoseStamped, in
+        order) are fully plannable when starting from the joints dict. Nothing moves."""
+        move_group = self.move_group_ee
+        state = moveit_msgs.msg.RobotState(is_diff=True)
+        state.joint_state.name = list(joints)
+        state.joint_state.position = list(joints.values())
+        try:
+            for target in targets:
+                move_group.set_start_state(state)
+                path, fraction = move_group.compute_cartesian_path([copy.deepcopy(target.pose)], 0.005)
+                if fraction < 1.0 or not path.joint_trajectory.points:
+                    return False
+                state.joint_state.name = path.joint_trajectory.joint_names
+                state.joint_state.position = list(path.joint_trajectory.points[-1].positions)
+            return True
+        finally:
+            move_group.set_start_state_to_current_state()
+
+    def _grasp_orientations(self, grasp_pose, approach_vec):
+        """[(grasp pose, pre-grasp joint goal or None)] for grasp_pose and its 180° roll
+        about the approach axis, best first. With ~nearest_ik_goal the order is: the
+        straight descent, back-out and lift are plannable from the pre-grasp IK solution,
+        then that solution's distance to the current joints; otherwise the supplied
+        orientation first, as before. The wrist can need well over 2 rad more to reach one
+        orientation than the other, which is most of the extra length of long pre-grasp
+        paths."""
+        options = [grasp_pose, self._roll_about_approach(grasp_pose)]
+        if not self.nearest_ik_goal:
+            return [(option, None) for option in options]
+        ranked = []
+        for option in options:
+            nearest = self._nearest_ik_goal(self._pre_grasp_pose(option, approach_vec), self.move_group_ee)
+            if nearest is None:
+                ranked.append(((True, np.inf), option, None))
+                continue
+            backout_pose, post_grasp_pose = post_grasp_poses(option, approach_vec)
+            lines_ok = self._straight_lines_ok(nearest[0], [option, backout_pose, post_grasp_pose])
+            ranked.append(((not lines_ok, nearest[1]), option, nearest[0]))
+        print("Grasp orientations (straight lines blocked, pre-grasp joint distance rad): "
+              f"supplied {ranked[0][0]}, rolled 180° {ranked[1][0]}")
+        ranked.sort(key=lambda r: r[0])  # stable: ties keep the supplied orientation first
+        return [(option, joints) for _, option, joints in ranked]
+
+    def _plan_to_pre_grasp(self, grasp_pose, approach_vec, movement, contents_xyz=None):
+        """go_to_pose to the pre-grasp pose of grasp_pose with the crate contents (except
+        a corridor around this approach) in the planning scene, so the arm doesn't sweep
+        through the trusses on its way there. Removed again afterwards: the descent, grasp
+        and lift happen inside the corridor, with the target truss in the gripper.
+
+        Tries both orientations from _grasp_orientations, best first. Returns
+        (result, grasp pose of the orientation reached): the descent, back-out and lift
+        must use that same orientation, otherwise the straight-line descent would have to
+        turn the wrist half a turn."""
+        added = False
+        if self.avoid_crate_contents:
+            try:
+                obstacle = self._crate_contents_obstacle()
+                if contents_xyz is None:
+                    contents_xyz = obstacle.capture_xyz()
+                p = grasp_pose.pose.position
+                added = obstacle.add([p.x, p.y, p.z], approach_vec, xyz=contents_xyz) > 0
+            except Exception as e:
+                rospy.logwarn(f"Crate contents: could not add obstacle ({e}); planning without it")
+        try:
+            if self.motion_method == 'waypoints':
+                return self._waypoints_to_pre_grasp(grasp_pose, approach_vec, movement)
+            for i, (option, joint_goal) in enumerate(self._grasp_orientations(grasp_pose, approach_vec)):
+                # No allow_flip: go_to_pose's own flip would change only the pre-grasp
+                # pose and not the rest of the grasp; the loop tries the other orientation.
+                if self.go_to_pose(goal_pose=self._pre_grasp_pose(option, approach_vec), move_group=self.move_group_ee,
+                                   allow_flip=False, movement=movement, is_retry=i > 0,
+                                   joint_goal=joint_goal) == "success":
+                    return "success", option
+            return "failure", None
+        finally:
+            if added:
+                obstacle.remove()
+
+    def _entry_pose(self, grasp_pose, approach_vec):
+        """Waypoint above the crate: WAYPOINT_ENTRY_OFFSET_M back along the approach axis."""
+        entry = copy.deepcopy(grasp_pose)
+        entry.pose.position.x -= approach_vec[0] * WAYPOINT_ENTRY_OFFSET_M
+        entry.pose.position.y -= approach_vec[1] * WAYPOINT_ENTRY_OFFSET_M
+        entry.pose.position.z -= approach_vec[2] * WAYPOINT_ENTRY_OFFSET_M
+        return entry
+
+    def _cartesian_path_from(self, start_joints, target):
+        """Collision-checked straight line from start_joints (dict, or None for the current
+        state) to target. Returns (plan, end joints dict) or (None, None). Nothing moves."""
+        move_group = self.move_group_ee
+        try:
+            if start_joints is not None:
+                state = moveit_msgs.msg.RobotState(is_diff=True)
+                state.joint_state.name = list(start_joints)
+                state.joint_state.position = list(start_joints.values())
+                move_group.set_start_state(state)
+            else:
+                move_group.set_start_state_to_current_state()
+            path, fraction = move_group.compute_cartesian_path([copy.deepcopy(target.pose)], 0.005)
+        finally:
+            move_group.set_start_state_to_current_state()
+        if fraction < 1.0 or len(path.joint_trajectory.points) < 2:
+            return None, None
+        end = path.joint_trajectory.points[-1].positions
+        return path, dict(zip(path.joint_trajectory.joint_names, end))
+
+    def _waypoint_routes(self, grasp_pose, approach_vec):
+        """Both grasp orientations (as _grasp_orientations) with their waypoint route:
+        [(grasp pose, entry pose, transit plan or None, approach ok, descent ok)], best
+        first: transit and approach straight lines both feasible, then descent/back-out/
+        lift feasible, then the shorter transit (joint space)."""
+        routes = []
+        for option in (grasp_pose, self._roll_about_approach(grasp_pose)):
+            entry = self._entry_pose(option, approach_vec)
+            pre_grasp = self._pre_grasp_pose(option, approach_vec)
+            transit, entry_joints = self._cartesian_path_from(None, entry)
+            approach, pre_joints = self._cartesian_path_from(entry_joints, pre_grasp) if transit else (None, None)
+            descent_ok = False
+            if approach is not None:
+                backout_pose, post_grasp_pose = post_grasp_poses(option, approach_vec)
+                descent_ok = self._straight_lines_ok(pre_joints, [option, backout_pose, post_grasp_pose])
+            length = self._joint_path_length(transit) if transit else np.inf
+            routes.append(((approach is None, not descent_ok, length), option, entry, transit, approach is not None, descent_ok))
+        print("Waypoint routes (approach blocked, descent blocked, transit rad): "
+              f"supplied {routes[0][0]}, rolled 180° {routes[1][0]}")
+        routes.sort(key=lambda r: r[0])
+        return [r[1:] for r in routes]
+
+    def _waypoints_to_pre_grasp(self, grasp_pose, approach_vec, movement):
+        """motion_method 'waypoints' (crate contents already in the scene): straight
+        transit to the entry pose above the crate, then straight along the approach axis
+        to pre-grasp, through the corridor kept free of crate contents. A blocked transit
+        is planned with the planner instead (go_to_pose: nearest IK goal, current
+        pipeline); a blocked approach falls back to planning to pre-grasp. Returns
+        (result, grasp pose of the orientation used), like _plan_to_pre_grasp."""
+        for i, (option, entry, transit, approach_ok, descent_ok) in enumerate(self._waypoint_routes(grasp_pose, approach_vec)):
+            if not descent_ok and i > 0:
+                break  # neither orientation has a feasible descent: stop after the first try
+            pre_grasp = self._pre_grasp_pose(option, approach_vec)
+            if transit is not None:
+                reached_entry = self._run_cartesian_segment(entry, f"{movement}_transit", WAYPOINT_TRANSIT_VELOCITY_SCALING,
+                                                           WAYPOINT_TRANSIT_ACCELERATION_SCALING, is_retry=i > 0) == "success"
+            else:
+                print("Straight transit blocked, planning to the entry pose")
+                reached_entry = self.go_to_pose(goal_pose=entry, move_group=self.move_group_ee, allow_flip=False,
+                                                movement=f"{movement}_transit", is_retry=i > 0) == "success"
+            if not reached_entry:
+                continue
+            # Re-planned from where the arm actually is, so it is checked from the real state
+            if self._run_cartesian_segment(pre_grasp, f"{movement}_approach", WAYPOINT_APPROACH_VELOCITY_SCALING,
+                                           WAYPOINT_APPROACH_ACCELERATION_SCALING, is_retry=i > 0) == "success":
+                return "success", option
+            print("Straight approach blocked, planning to the pre-grasp pose")
+            if self.go_to_pose(goal_pose=pre_grasp, move_group=self.move_group_ee, allow_flip=False,
+                               movement=f"{movement}_approach", is_retry=True) == "success":
+                return "success", option
+        return "failure", None
+
+    def _run_cartesian_segment(self, target, movement, velocity_scaling, acceleration_scaling, is_retry=False):
+        """Straight line from the current pose to target (collision-checked against the
+        planning scene), executed and logged to the metrics CSV like a go_to_pose move."""
+        move_group = self.move_group_ee
+        metrics = self._new_metrics_row(movement, is_retry)
+        metrics["goal_type"] = "cartesian"
+        try:
+            plan_start = time.time()
+            plan, _ = self._cartesian_path_from(None, target)
+            metrics["planning_duration_s"] = time.time() - plan_start
+            metrics["planning_success"] = plan is not None
+            if plan is None:
+                metrics["result"] = "failure"
+                return "failure"
+            metrics["path_length"] = self._joint_path_length(plan)
+            metrics["num_waypoints"] = len(plan.joint_trajectory.points)
+            plan = self._retime(move_group, plan, velocity_scaling, acceleration_scaling)
+            exec_start = time.time()
+            executed = move_group.execute(plan, wait=True)
+            metrics["execution_duration_s"] = time.time() - exec_start
+            metrics["execution_success"] = executed
+            move_group.stop()
+            close = executed and all_close(target.pose, move_group.get_current_pose().pose, 0.05)
+            metrics["goal_reached"] = close
+            metrics["result"] = "success" if close else "failure"
+            return metrics["result"]
+        finally:
+            self._log_metrics(metrics)
 
     def grasp(self):
         # Own the recording for the whole pre-grasp -> descent -> retreat sequence as a
@@ -691,20 +1065,21 @@ class Planner(object):
             clip_stem = f"{time.strftime('%Y%m%d_%H%M%S')}_{self.planner_label}_grasp"
             self._start_recording(clip_stem)
         try:
+            if self.motion_method == 'luuk':
+                return self._grasp_luuk()
             supplied_grasp_pose = self.grasp_pose
             approach_vec = self._get_approach_vec(supplied_grasp_pose)
+            # The arm is still at the pose the grasp point was picked from, so this
+            # cloud shows the whole crate: grab it before anything moves.
+            contents_xyz = self._capture_crate_contents()
 
             if self.pre_grasp_gripper() == "success":
-                # Pre-grasp: retreat along approach axis before the target
-                pre_grasp_pose = copy.deepcopy(supplied_grasp_pose)
-                pre_grasp_pose.pose.position.x -= approach_vec[0] * 0.05
-                pre_grasp_pose.pose.position.y -= approach_vec[1] * 0.05
-                pre_grasp_pose.pose.position.z -= approach_vec[2] * 0.05
-
-                # Grasp: close exactly at the supplied grasp point (no extra sink)
-                grasp_pose = copy.deepcopy(supplied_grasp_pose)
-
-                if self.go_to_pose(goal_pose=pre_grasp_pose, move_group=self.move_group_ee, allow_flip=True, movement="grasp_pre_grasp") == "success":
+                # Pre-grasp: retreat along approach axis before the target. grasp_pose is
+                # the supplied grasp, possibly rolled 180° about its approach axis (same
+                # grasp point and approach); the gripper closes exactly at the grasp point.
+                result, grasp_pose = self._plan_to_pre_grasp(supplied_grasp_pose, approach_vec, movement="grasp_pre_grasp",
+                                                             contents_xyz=contents_xyz)
+                if result == "success":
                     # Slow final descent onto the truss (pre-grasp -> grasp)
                     if self.go_to_pose_cartesian(goal_pose=grasp_pose, move_group=self.move_group_ee,
                                                  velocity_scaling=GRASP_DESCENT_VELOCITY_SCALING,
@@ -730,6 +1105,254 @@ class Planner(object):
             self._video_call_depth -= 1
             if self._video_call_depth == 0:
                 self._stop_recording()
+
+    def go_to_saved_pose(self):
+        # Straight-line (Cartesian) return to the SavePose pose. A straight line can be
+        # blocked (crate walls, joint limits), so like grasp()'s lift it falls back to
+        # the regular planner, which also does the saved-joints reset in go_to_pose().
+        if getattr(self, 'saved_pose_ee', None) is None:
+            print("No pose saved -- press SavePose first")
+            return "failure"
+        self.open_gripper()
+        self._video_call_depth += 1
+        if self._video_call_depth == 1:
+            clip_stem = f"{time.strftime('%Y%m%d_%H%M%S')}_{self.planner_label}_go_to_saved_pose"
+            self._start_recording(clip_stem)
+        try:
+            if self.motion_method == 'luuk':
+                return self._go_to_pose_luuk(self.saved_pose_ee, self.move_group_ee, movement='go_to_saved_pose')
+            if self.go_to_pose_cartesian(goal_pose=self.saved_pose_ee, move_group=self.move_group_ee,
+                                         velocity_scaling=SAVED_POSE_CARTESIAN_VELOCITY_SCALING,
+                                         acceleration_scaling=SAVED_POSE_CARTESIAN_ACCELERATION_SCALING) == "success":
+                # Same joint reset go_to_pose() does, so the camera view is identical each time
+                self.move_group_ee.go(self.saved_joints_ee, wait=True)
+                self.move_group_ee.stop()
+                self.move_group_ee.clear_pose_targets()
+                rospy.sleep(1)  # sleep for camera to refocus etc
+                return "success"
+            print("Cartesian path to saved pose failed, falling back to the planner")
+            return self.go_to_pose(self.saved_pose_ee, self.move_group_ee, allow_flip=False, movement='go_to_saved_pose')
+        finally:
+            self._video_call_depth -= 1
+            if self._video_call_depth == 0:
+                self._stop_recording()
+
+    def _drop_off_move(self, movement):
+        if self.motion_method == 'luuk':
+            goal, move_group, allow_flip = self.find_goal_pose(movement=movement)
+            return self._go_to_pose_luuk(goal, move_group, allow_flip=allow_flip, movement=movement,
+                                         retry_straight_line=movement == 'go_to_place_above')
+        # Straight-line (Cartesian) move for one drop_off() step, falling back to the
+        # regular planner if the line is blocked (same pattern as go_to_saved_pose()).
+        goal, move_group, allow_flip = self.find_goal_pose(movement=movement)
+        if self.go_to_pose_cartesian(goal_pose=goal, move_group=move_group,
+                                     velocity_scaling=DROP_OFF_CARTESIAN_VELOCITY_SCALING,
+                                     acceleration_scaling=DROP_OFF_CARTESIAN_ACCELERATION_SCALING) == "success":
+            return "success"
+        print(f"Cartesian {movement} failed, falling back to the planner")
+        return self.go_to_pose(goal, move_group, allow_flip=allow_flip, movement=movement)
+
+    def drop_off(self):
+        # Carry the held truss to the saved place pose (SavePosePlace), release it and
+        # retreat: the same go_to_place_above -> go_to_place -> open_gripper ->
+        # go_to_place_retreat chain the crate pipeline runs, as one command/clip so it
+        # can follow Simple Pick Point. Owns the recording like grasp() does.
+        if getattr(self, 'saved_pose_ee_place', None) is None:
+            print("No drop-off pose saved -- move the arm there and press SavePosePlace first")
+            return "failure"
+        self._video_call_depth += 1
+        if self._video_call_depth == 1:
+            clip_stem = f"{time.strftime('%Y%m%d_%H%M%S')}_{self.planner_label}_drop_off"
+            self._start_recording(clip_stem)
+        try:
+            for movement in ('go_to_place_above', 'go_to_place'):
+                if self._drop_off_move(movement) != "success":
+                    print(f"Drop-off failed at {movement}")
+                    return "failure"
+            if self.open_gripper() != "success":
+                print("Drop-off failed to open the gripper")
+                return "failure"
+            return self._drop_off_move('go_to_place_retreat')
+        finally:
+            self._video_call_depth -= 1
+            if self._video_call_depth == 0:
+                self._stop_recording()
+
+    # ---- Luuk van den Bent's motion (~motion_method 'luuk') ------------------------------
+    # Ported from plan_movement.py in his last upstream commit (d003c2a) as the baseline
+    # for comparing grasp/place motion. Kept as he wrote it except:
+    # - his two Cartesian impedance-controller moves (the grasp descent, and the fallback
+    #   when LIN can't plan go_to_place_above) are straight lines on the position
+    #   (trajectory) controller instead, at his speed, stopped on contact
+    #   (_straight_line_luuk); there is no controller switching;
+    # - contact is a rise in F_ext z of more than force_limit (6 N) over its value at the
+    #   start of the move (he compared the absolute value with 6 N);
+    # - metrics + video logging like go_to_pose; a failed execution is retried once
+    #   (he switched controllers away and back and retried without limit);
+    # - his extra ceiling/wall collision objects are not added (both methods use the crate scene).
+
+    def _luuk_offset_z(self, pose_stamped, dz):
+        pose = copy.deepcopy(pose_stamped)
+        pose.pose.position.z += dz
+        return pose
+
+    def _grasp_luuk(self):
+        supplied_grasp_pose = self.grasp_pose
+        if self.pre_grasp_gripper() == "success":
+            pre_grasp_pose = self._luuk_offset_z(supplied_grasp_pose, LUUK_PRE_GRASP_HEIGHT_M)
+            grasp_pose = self._luuk_offset_z(supplied_grasp_pose, -LUUK_GRASP_SINK_M)
+            if self._go_to_pose_luuk(pre_grasp_pose, self.move_group_ee, allow_flip=True, movement="grasp_pre_grasp") == "success":
+                if self._go_to_pose_luuk(grasp_pose, self.move_group_ee, mode="straight_line", movement="grasp_descent") == "success":
+                    if self.close_gripper(save=True) == "success":
+                        post_grasp_pose = self._luuk_offset_z(supplied_grasp_pose, LUUK_POST_GRASP_HEIGHT_M)
+                        return self._go_to_pose_luuk(post_grasp_pose, self.move_group_ee, allow_flip=True, movement="grasp_post_grasp")
+        return "failure"
+
+    def _go_to_pose_luuk(self, goal_pose, move_group, mode="lin", allow_flip=False, retry_straight_line=False,
+                         speed=1, movement=None, is_retry=False, execution_retries=1):
+        """His go_to_pose: Pilz LIN, retried with the goal rolled 180° about the planning
+        frame's z if allowed, or as a straight-line move if retry_straight_line (his
+        impedance retry). mode="straight_line": _straight_line_luuk at speed (his mm per
+        20 Hz step) for his impedance moves."""
+        if goal_pose == None:
+            return 'failure'
+        self._video_call_depth += 1
+        if self._video_call_depth == 1:
+            clip_stem = f"{time.strftime('%Y%m%d_%H%M%S')}_{self.planner_label}_{movement or 'go_to_pose'}"
+            self._start_recording(clip_stem)
+        metrics = self._new_metrics_row(movement, is_retry)
+        metrics["goal_type"] = f"luuk_{mode}"
+        try:
+            if mode == "lin":
+                move_group.set_planning_pipeline_id("pilz_industrial_motion_planner")
+                move_group.set_planner_id("LIN")
+                move_group.set_max_acceleration_scaling_factor(LUUK_LIN_ACCELERATION_SCALING)
+                move_group.set_max_velocity_scaling_factor(LUUK_LIN_VELOCITY_SCALING)
+                move_group.set_pose_target(goal_pose)
+                plan_start = time.time()
+                success, plan, _, error = move_group.plan()
+                metrics["planning_duration_s"] = time.time() - plan_start
+                metrics["planning_success"] = success
+                if success:
+                    metrics["path_length"] = self._joint_path_length(plan)
+                    metrics["num_waypoints"] = len(plan.joint_trajectory.points)
+                if retry_straight_line and not success:
+                    print("Could not plan LIN due to: ", error, "retrying as a straight line (his impedance retry)")
+                    metrics["result"] = "failure"
+                    return self._go_to_pose_luuk(goal_pose, move_group, mode="straight_line", speed=10,
+                                                 movement=movement, is_retry=True)
+
+                print("PLANNING WAS : ", success)
+                if not success and goal_pose != self.saved_pose_ee:
+                    metrics["result"] = "failure"
+                    if allow_flip:
+                        flipped_goal_pose = flip_z_rotation_stamped_pose(goal_pose)
+                        return self._go_to_pose_luuk(flipped_goal_pose, move_group, movement=movement, is_retry=True)
+                    return 'failure'
+                elif success:
+                    exec_start = time.time()
+                    plan_executed = move_group.execute(plan, wait=True)
+                    metrics["execution_duration_s"] = time.time() - exec_start
+                    metrics["execution_success"] = plan_executed
+                    move_group.stop()
+                    move_group.clear_pose_targets()
+                    if not plan_executed:
+                        metrics["result"] = "failure"
+                        if execution_retries <= 0:
+                            return 'failure'
+                        return self._go_to_pose_luuk(goal_pose, move_group, movement=movement, is_retry=True,
+                                                     execution_retries=execution_retries - 1)
+
+            elif mode == "straight_line":
+                # As his impedance move: success once the move has run (to the goal or to
+                # contact), without the arrival check below; goal_reached is still logged.
+                exec_start = time.time()
+                executed, plan = self._straight_line_luuk(goal_pose, move_group, speed)
+                metrics["execution_duration_s"] = time.time() - exec_start
+                metrics["planning_success"] = plan is not None
+                if plan is not None:
+                    metrics["path_length"] = self._joint_path_length(plan)
+                    metrics["num_waypoints"] = len(plan.joint_trajectory.points)
+                metrics["execution_success"] = executed
+                metrics["goal_reached"] = all_close(goal_pose.pose, move_group.get_current_pose().pose, 0.05)
+                metrics["result"] = "success" if executed else "failure"
+                return metrics["result"]
+
+            else:
+                print("UNKNOWN MODE: ", mode)
+                metrics["result"] = "failure"
+                return 'failure'
+
+            if goal_pose == self.saved_pose_ee:  # Also reset joints when going to saved pose
+                move_group.set_planner_id("PTP")
+                move_group.go(self.saved_joints_ee, wait=True)
+                move_group.stop()
+                move_group.clear_pose_targets()
+                rospy.sleep(1)  # sleep for camera to refocus etc
+
+            current_pose = move_group.get_current_pose().pose
+            close = all_close(goal_pose.pose, current_pose, 0.05)
+            print("MOVEMENT WAS CLOSE?: ", close)
+            metrics["goal_reached"] = close
+            metrics["result"] = "success" if close else "failure"
+            return metrics["result"]
+        finally:
+            self._log_metrics(metrics)
+            self._video_call_depth -= 1
+            if self._video_call_depth == 0:
+                self._stop_recording()
+
+    def _straight_line_luuk(self, goal_pose, move_group, speed=1):
+        """Position-controller version of his cartesian_go_to_pose: a straight line (with
+        orientation slerp) from the current pose to goal_pose that takes as long as his
+        equilibrium-pose interpolation did (steps of speed mm / speed mrad at 20 Hz), and
+        is stopped when contact is detected. Returns (executed, plan or None)."""
+        start_pose = move_group.get_current_pose()
+        if not all_close(start_pose, goal_pose, 0.1, only_check_angle=True):
+            goal_pose = flip_z_rotation_stamped_pose(goal_pose)  # as in his impedance branch
+
+        plan, fraction = move_group.compute_cartesian_path([start_pose.pose, copy.deepcopy(goal_pose.pose)], 0.005)
+        print("STRAIGHT LINE PLANNING FRACTION: ", fraction)
+        if fraction < 1.0 or len(plan.joint_trajectory.points) < 2:
+            return False, None
+        plan = self._retime(move_group, plan, LUUK_LIN_VELOCITY_SCALING, LUUK_LIN_ACCELERATION_SCALING)
+
+        # His duration: max(distance / step, angle / step) steps at 20 Hz
+        p0, p1 = start_pose.pose.position, goal_pose.pose.position
+        dist = np.linalg.norm([p1.x - p0.x, p1.y - p0.y, p1.z - p0.z])
+        o0, o1 = start_pose.pose.orientation, goal_pose.pose.orientation
+        theta = np.arccos(np.clip(abs(o0.x*o1.x + o0.y*o1.y + o0.z*o1.z + o0.w*o1.w), -1, 1))
+        step = 0.001 * speed
+        target_duration = max(np.floor(dist / step), np.floor(theta / step)) / 20.0
+        duration = plan.joint_trajectory.points[-1].time_from_start.to_sec()
+        if duration > 0 and target_duration > duration:
+            k = target_duration / duration  # slow down: stretch time, scale velocities/accelerations
+            for point in plan.joint_trajectory.points:
+                point.time_from_start = rospy.Duration.from_sec(point.time_from_start.to_sec() * k)
+                point.velocities = [v / k for v in point.velocities]
+                point.accelerations = [a / k**2 for a in point.accelerations]
+
+        if self.execute_trajectory_client is None:
+            self.execute_trajectory_client = actionlib.SimpleActionClient('execute_trajectory', moveit_msgs.msg.ExecuteTrajectoryAction)
+        if not self.execute_trajectory_client.wait_for_server(rospy.Duration(5)):
+            print("MoveIt execute_trajectory action not available")
+            return False, plan
+        force_at_start = self.force_z
+        self.execute_trajectory_client.send_goal(moveit_msgs.msg.ExecuteTrajectoryGoal(trajectory=plan))
+        rate = rospy.Rate(20)
+        while not rospy.is_shutdown():
+            if self.execute_trajectory_client.wait_for_result(rospy.Duration(0.001)):
+                result = self.execute_trajectory_client.get_result()
+                return result is not None and result.error_code.val == moveit_msgs.msg.MoveItErrorCodes.SUCCESS, plan
+            if (force_at_start is not None and self.force_z is not None
+                    and self.force_z - force_at_start > self.force_limit):
+                self.execute_trajectory_client.cancel_goal()
+                self.execute_trajectory_client.wait_for_result(rospy.Duration(2))
+                print("CONTACT DETECTED, STOPPING THE STRAIGHT LINE")
+                return True, plan
+            rate.sleep()
+        self.execute_trajectory_client.cancel_goal()
+        return False, plan
 
     def open_gripper(self):
         rospy.sleep(0.5)

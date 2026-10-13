@@ -1,0 +1,36 @@
+<?xml version="1.0"?>
+<!--
+  Test the crate-contents obstacle (common/crate_contents.py) in Gazebo, which has no
+  simulated camera: a saved real crate cloud is replayed on the camera topic instead.
+
+  1. roslaunch panda_moveit_config_vine_tomato gazebo_moveit.launch robot_name:=panda arm_id:=panda
+  2. roslaunch grasp crate_contents_sim_test.launch            (this file)
+  3. rosrun grasp test_crate_contents_sim.py                    (moves to pre-grasp poses)
+
+  The tomatoes only exist in MoveIt's planning scene, not in the Gazebo world, so
+  watch the planned paths in RViz rather than looking for contact in Gazebo.
+-->
+<launch>
+  <arg name="robot_name" default="panda"/>
+  <!-- empty: newest cloud in experiments/full_crate_clouds/ -->
+  <arg name="pcd" default=""/>
+  <arg name="z_offset" default="0.0"/>
+
+  <param name="robot_name" type="str" value="$(arg robot_name)"/>
+  <param name="camera_frame" type="str" value="camera_color_optical_frame"/>
+  <param name="planning_frame" type="str" value="$(arg robot_name)_link0"/>
+
+  <group ns="$(arg robot_name)">
+    <node name="replay_crate_cloud" pkg="grasp" type="replay_crate_cloud.py" output="screen">
+      <param name="pcd" value="$(arg pcd)"/>
+      <param name="z_offset" value="$(arg z_offset)"/>
+      <param name="topic" value="/$(arg robot_name)/camera/depth/color/points"/>
+    </node>
+
+    <!-- No anonymous name here so its params live at /panda/plan_movement/... -->
+    <node name="plan_movement" pkg="grasp" type="plan_movement_node.py" output="screen">
+      <param name="record_video" value="false"/>
+      <param name="planner_id" value="RRTConnect"/>
+    </node>
+  </group>
+</launch>

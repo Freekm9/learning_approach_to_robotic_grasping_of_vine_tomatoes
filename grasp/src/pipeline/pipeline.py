@@ -100,7 +100,7 @@ class Idle(smach.State):
         userdata.command = next_state
 
         if (next_state == "create_crate" or next_state == "save_pose" or next_state == "save_pose_place" or next_state == "go_to_saved_pose" or next_state == "go_to_center" 
-            or next_state == "go_to_place_above" or next_state == "go_to_place" or next_state == "go_to_place_retreat" or next_state == "go_to_truss"
+            or next_state == "go_to_place_above" or next_state == "go_to_place" or next_state == "go_to_place_retreat" or next_state == "drop_off" or next_state == "go_to_truss"
             or next_state == "grasp" or next_state == "check_grasp_success" or next_state == "open_gripper" or next_state == "pre_grasp_gripper" or next_state == "close_gripper"):
             return 'move'
         elif next_state == "detect_truss_obb":
@@ -316,7 +316,7 @@ class MoveRobot(smach.State):
 
     def execute(self, userdata):
         rospy.logdebug('Executing state Move Robot, command: ', userdata.command)
-        possible_commands = ["create_crate", "save_pose", "save_pose_place", "go_to_saved_pose", "go_to_truss", "grasp", "go_to_center", "go_to_place_above", "go_to_place", "go_to_place_retreat", "check_grasp_success", "open_gripper", "pre_grasp_gripper","close_gripper"]
+        possible_commands = ["create_crate", "save_pose", "save_pose_place", "go_to_saved_pose", "go_to_truss", "grasp", "go_to_center", "go_to_place_above", "go_to_place", "go_to_place_retreat", "drop_off", "check_grasp_success", "open_gripper", "pre_grasp_gripper","close_gripper"]
         if userdata.command in possible_commands:
             #Set relevant data
             if userdata.command == "go_to_truss":
@@ -341,6 +341,9 @@ class MoveRobot(smach.State):
                     return 'failure'
             except:
                 print("PIPELINE FAILED TO MOVE ROBOT")
+                # Without this, success keeps its previous (True) value and the full
+                # pipeline re-sends the same movement over and over.
+                userdata.success = False
                 return 'failure'
         else:
             userdata.success = False
