@@ -41,6 +41,8 @@ import os
 
 # Pre-grasp offset back along the approach axis; must match simple_pick_point.py's IK checks.
 PRE_GRASP_OFFSET_M = 0.05
+# MoveIt pipelines that reject pose goals, so go_to_pose always resolves IK for them
+JOINT_GOAL_PIPELINES = ("chomp", "stomp")
 # Speed of the straight-line descent from pre-grasp to grasp in grasp(), as fractions
 # of the joint velocity/acceleration limits (other Cartesian moves default to 0.15/0.3).
 GRASP_DESCENT_VELOCITY_SCALING = 0.05
@@ -491,12 +493,28 @@ class Planner(object):
             move_group.set_max_acceleration_scaling_factor(0.3)
             move_group.set_max_velocity_scaling_factor(0.3)
 
-            if self.pipeline_id == "chomp":
-                # chomp only accepts joint-space goals, so resolve the Cartesian
-                # goal_pose to a joint state ourselves rather than set_pose_target.
-                ik_joint_state = self._resolve_ik(goal_pose, move_group)
-                if ik_joint_state is None:
-                    print("IK failed for chomp goal (no collision-free solution found)")
+            if self.pipeline_id != "pink":
+                # Every MoveIt pipeline gets the same kind of goal (the nearest IK
+                # solution), so a planner comparison isn't skewed by which IK branch
+                # each planner happens to plan to.
+                current = np.array(move_group.get_current_joint_values())
+                if joint_goal is not None:
+                    target = np.array([joint_goal[n] for n in move_group.get_active_joints()])
+                    nearest = (joint_goal, float(np.linalg.norm(target - current)))
+                elif self.nearest_ik_goal:
+                    nearest = self._nearest_ik_goal(goal_pose, move_group)
+                elif self.pipeline_id in JOINT_GOAL_PIPELINES:
+                    ik_joint_state = self._resolve_ik(goal_pose, move_group)
+                    nearest = None if ik_joint_state is None else (ik_joint_state, float(np.linalg.norm(
+                        np.array([ik_joint_state[n] for n in move_group.get_active_joints()]) - current)))
+                    if nearest is not None:
+                        metrics["goal_type"] = "first_ik"
+                else:
+                    nearest = None
+                if nearest is None and self.pipeline_id in JOINT_GOAL_PIPELINES:
+                    # chomp/stomp only accept joint-space goals ("Only joint-space goals are
+                    # supported"), so without an IK solution there is nothing to plan to
+                    print(f"IK failed for {self.pipeline_id} goal (no collision-free solution found)")
                     metrics["planning_success"] = False
                     metrics["result"] = "failure"
                     if allow_flip and goal_pose != self.saved_pose_ee:
@@ -504,17 +522,9 @@ class Planner(object):
                         return self.go_to_pose(goal_pose=flipped_goal_pose, move_group=move_group,
                                                 movement=movement, is_retry=True) #retry flipped
                     return 'failure'
-                move_group.set_joint_value_target(ik_joint_state)
-            elif self.pipeline_id != "pink":
-                if joint_goal is not None:
-                    current = np.array(move_group.get_current_joint_values())
-                    target = np.array([joint_goal[n] for n in move_group.get_active_joints()])
-                    nearest = (joint_goal, float(np.linalg.norm(target - current)))
-                else:
-                    nearest = self._nearest_ik_goal(goal_pose, move_group) if self.nearest_ik_goal else None
                 if nearest is not None:
                     move_group.set_joint_value_target(nearest[0])
-                    metrics["goal_type"] = "nearest_ik"
+                    metrics["goal_type"] = metrics["goal_type"] or "nearest_ik"
                     metrics["direct_joint_distance"] = nearest[1]
                 else:
                     # IK found nothing (or disabled): let OMPL sample IK itself, as before
@@ -834,7 +844,8 @@ class Planner(object):
             cell_m=rospy.get_param('~crate_contents_cell_m', 0.02),
             carve_radius_m=rospy.get_param('~crate_contents_carve_radius_m', 0.04),
             corridor_length_m=WAYPOINT_ENTRY_OFFSET_M,
-            finger_margin_m=rospy.get_param('~crate_contents_finger_margin_m', 0.015))
+            finger_margin_m=rospy.get_param('~crate_contents_finger_margin_m', 0.015),
+            carve_mode=rospy.get_param('~crate_contents_carve_mode', 'cylinder'))
 
     def _capture_crate_contents(self):
         """Point cloud (planning frame) of the crate for _plan_to_pre_grasp, or None if
@@ -926,8 +937,9 @@ class Planner(object):
                 obstacle = self._crate_contents_obstacle()
                 if contents_xyz is None:
                     contents_xyz = obstacle.capture_xyz()
-                p = grasp_pose.pose.position
-                added = obstacle.add([p.x, p.y, p.z], approach_vec, xyz=contents_xyz) > 0
+                p, o = grasp_pose.pose.position, grasp_pose.pose.orientation
+                added = obstacle.add([p.x, p.y, p.z], approach_vec, xyz=contents_xyz,
+                                     grasp_quat=[o.x, o.y, o.z, o.w]) > 0
             except Exception as e:
                 rospy.logwarn(f"Crate contents: could not add obstacle ({e}); planning without it")
         try:

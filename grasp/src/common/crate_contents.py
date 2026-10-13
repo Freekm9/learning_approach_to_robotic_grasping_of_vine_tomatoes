@@ -12,6 +12,12 @@ approach corridor (the line from the grasp point back out along the approach axi
 through the pre-grasp pose) is left out. The descent, grasp and lift happen inside that
 corridor, so the obstacle is removed again once the arm is at the pre-grasp pose.
 
+carve_mode 'gripper' also leaves out every column inside the gripper's own volume
+(hand + wrist camera, a box around the TCP) swept along that corridor. A thin cylinder
+is enough for a straight-down approach, where the hand stays above the trusses at the
+pre-grasp pose; a tilted approach brings the hand down to the trusses beside the stem,
+and with the cylinder alone its pre-grasp pose is in collision.
+
 Why not MoveIt's octomap (sensors_kinect_pointcloud.yaml)? It keeps integrating the
 wrist camera while the arm moves, and the target truss itself would block the final
 descent; it would have to be cleared and refilled around every grasp, without a way to
@@ -126,6 +132,25 @@ def carve_corridor(columns, floor_z, cell_m, grasp_xyz, approach_vec, carve_radi
     return kept
 
 
+def carve_gripper_box(columns, floor_z, cell_m, grasp_xyz, grasp_rot, half_x_m, half_y_m, corridor_length_m):
+    """Drop every column that reaches into the box |x| <= half_x_m, |y| <= half_y_m,
+    -corridor_length_m <= z <= 0 in the grasp (TCP) frame: the gripper's volume swept from
+    the grasp point back out along the approach axis (TCP z). grasp_rot: scipy Rotation of
+    the TCP in the planning frame. Columns are tested at 8 points along their center
+    line, with the box grown by half the cell diagonal."""
+    a = np.asarray(grasp_xyz, dtype=float)
+    grow = cell_m / np.sqrt(2)
+    kept = []
+    for cx, cy, top in columns:
+        zs = np.linspace(floor_z, top, 8)
+        local = grasp_rot.inv().apply(np.stack([np.full(8, cx), np.full(8, cy), zs], axis=1) - a)
+        inside = ((np.abs(local[:, 0]) <= half_x_m + grow) & (np.abs(local[:, 1]) <= half_y_m + grow)
+                  & (local[:, 2] >= -corridor_length_m - grow) & (local[:, 2] <= grow))
+        if not inside.any():
+            kept.append((cx, cy, top))
+    return kept
+
+
 def columns_to_collision_object(columns, floor_z, cell_m, frame_id):
     obj = CollisionObject()
     obj.id = CRATE_CONTENTS_ID
@@ -149,7 +174,8 @@ class CrateContentsObstacle(object):
 
     def __init__(self, scene, tf_buffer, planning_frame, crate_interior, cloud_topic='camera/depth/color/points',
                  cell_m=0.02, carve_radius_m=0.04, corridor_length_m=0.30, above_rim_m=0.08,
-                 wall_margin_m=0.005, finger_margin_m=0.015, arm_id=None):
+                 wall_margin_m=0.005, finger_margin_m=0.015, arm_id=None, carve_mode='cylinder',
+                 gripper_half_x_m=0.06, gripper_half_y_m=0.11):
         self.scene = scene
         self.tf_buffer = tf_buffer
         self.planning_frame = planning_frame
@@ -163,6 +189,13 @@ class CrateContentsObstacle(object):
         self.corridor_length_m = corridor_length_m
         self.finger_margin_m = finger_margin_m
         self.arm_id = arm_id or planning_frame.split('_link0')[0]
+        if carve_mode not in ('cylinder', 'gripper'):
+            raise ValueError(f"carve_mode must be 'cylinder' or 'gripper', not {carve_mode!r}")
+        self.carve_mode = carve_mode
+        # Hand (~20 x 6 cm, long side along the closing axis TCP y) plus the wrist camera
+        # beside it (TCP x)
+        self.gripper_half_x_m = gripper_half_x_m
+        self.gripper_half_y_m = gripper_half_y_m
 
     def _lookup(self, target, source, stamp):
         tf = self.tf_buffer.lookup_transform(target, source, stamp, rospy.Duration(1.0))
@@ -190,9 +223,10 @@ class CrateContentsObstacle(object):
                       f"(fingers {finger_length * 100:.1f} cm long, margin {self.finger_margin_m * 100:.1f} cm)")
         return xyz
 
-    def add(self, grasp_xyz, approach_vec, xyz=None):
+    def add(self, grasp_xyz, approach_vec, xyz=None, grasp_quat=None):
         """Capture (unless xyz is given), build, carve and add the obstacle; returns the
-        number of columns added. Blocks until the planning scene contains it."""
+        number of columns added. Blocks until the planning scene contains it. grasp_quat
+        (x, y, z, w of the grasp pose) is needed for carve_mode 'gripper'."""
         start = time.time()
         if xyz is None:
             xyz = self.capture_xyz()
@@ -200,6 +234,13 @@ class CrateContentsObstacle(object):
         n_all = len(columns)
         columns = carve_corridor(columns, self.floor_z, self.cell_m, grasp_xyz, approach_vec,
                                  self.carve_radius_m, self.corridor_length_m)
+        if self.carve_mode == 'gripper':
+            if grasp_quat is None:
+                rospy.logwarn("Crate contents: carve_mode 'gripper' needs the grasp orientation; "
+                              "only the corridor cylinder is carved")
+            else:
+                columns = carve_gripper_box(columns, self.floor_z, self.cell_m, grasp_xyz, R.from_quat(grasp_quat),
+                                            self.gripper_half_x_m, self.gripper_half_y_m, self.corridor_length_m)
         if not columns:
             rospy.logwarn("Crate contents: no columns left to add (empty cloud/crate?)")
             return 0
