@@ -55,6 +55,7 @@ Usage (sim on its own ROS master, with the gripper the queries should be built f
     rosrun grasp planner_benchmark.py run --queries <dir>/queries.json \\
         --planners RRTConnect BiTRRT RRTstar chomp pink --repeats 5
     rosrun grasp planner_benchmark.py summarize --decide <dir>/results_*.csv
+    rosrun grasp planner_benchmark.py show --queries <dir>/queries.json --plan-key pre_grasp:... --planner RRTConnect
 
 build writes experiments/planner_benchmark/<timestamp>/queries.json; run writes
 results_<timestamp>.csv next to the query file it used.
@@ -541,6 +542,85 @@ def cmd_run(args):
     summarize([out_path])
 
 
+def cmd_show(args):
+    """Replan one start/goal pair (plan_key) with one planner --tries times and show the
+    path with the largest end-effector ratio in RViz: a DisplayTrajectory (robot animation)
+    and a TCP line strip, both latched, with the crate contents carved as in run. The paths
+    of a run are not stored, so for a sampling planner this finds a path like the logged
+    outlier, not that exact path."""
+    import rospy
+    from scipy.spatial.transform import Rotation as R
+    from moveit_msgs.msg import DisplayTrajectory, RobotState, RobotTrajectory
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+    from visualization_msgs.msg import Marker
+    from geometry_msgs.msg import Point
+    rospy.init_node('planner_benchmark_show')
+    with open(args.queries) as f:
+        data = json.load(f)
+    meta = data["meta"]
+    matches = [q for q in data["queries"] if q["reachable"] and plan_key(dict(q, move=q.get("move", "pre_grasp"))) == args.plan_key]
+    if not matches:
+        raise SystemExit(f"No reachable query with plan_key {args.plan_key} in {args.queries}")
+    query = dict(matches[0], move=matches[0].get("move", "pre_grasp"))
+    bench = Bench(args.robot_name)
+
+    contents = None
+    if query["move"] == "pre_grasp" and meta.get("crate_contents", True) and not args.no_contents:
+        from pcd_io import load_pcd
+        contents = bench.contents_obstacle()
+        cloud_xyz, _ = load_pcd(meta["cloud"])
+        grasp = query["grasp_pose"]
+        contents.add(grasp[:3], R.from_quat(grasp[3:]).apply([0, 0, 1]), xyz=cloud_xyz)
+    try:
+        best = None
+        for i in range(args.tries):
+            row, waypoints = plan_query(bench, args.planner, query, args)
+            if not waypoints:
+                print(f"try {i}: failed ({row['error_code'] or row['pink_reason']})")
+                continue
+            row.update(path_metrics(bench, waypoints, query))
+            print(f"try {i}: path ratio {row['path_ratio']}, ee ratio {row['ee_ratio']}, "
+                  f"min clearance {row['min_clearance_mm']} mm, {row['planning_time_s']} s")
+            if best is None or (row['ee_ratio'] or 0) > (best[0]['ee_ratio'] or 0):
+                best = (row, waypoints)
+            if args.min_ee_ratio and (row['ee_ratio'] or 0) >= args.min_ee_ratio:
+                break
+        if best is None:
+            raise SystemExit("No successful plan")
+        row, waypoints = best
+
+        start = RobotState()
+        start.joint_state.name = list(bench.joint_names)
+        start.joint_state.position = list(query["start_joints"])
+        traj = JointTrajectory(joint_names=list(bench.joint_names))
+        for k, q in enumerate(waypoints):
+            traj.points.append(JointTrajectoryPoint(positions=q, time_from_start=rospy.Duration(0.05 * k)))
+        display = DisplayTrajectory(trajectory_start=start, trajectory=[RobotTrajectory(joint_trajectory=traj)])
+        planner = bench.pink.get_planner(bench.move_group)
+        line = Marker(type=Marker.LINE_STRIP, action=Marker.ADD, ns="tcp_path", id=0)
+        line.scale.x = 0.004
+        line.header.frame_id = bench.frame
+        line.pose.orientation.w = 1.0
+        line.color.r, line.color.g, line.color.a = 1.0, 0.4, 1.0
+        line.points = [Point(*planner.frame_pose(q, f'{bench.robot_name}_hand_tcp').translation) for q in waypoints]
+        pub_traj = rospy.Publisher('/planner_benchmark/display_path', DisplayTrajectory, queue_size=1, latch=True)
+        pub_line = rospy.Publisher('/planner_benchmark/tcp_path', Marker, queue_size=1, latch=True)
+        rospy.sleep(0.5)
+        pub_traj.publish(display)
+        pub_line.publish(line)
+        if args.save:
+            with open(args.save, 'w') as f:
+                json.dump(dict(plan_key=args.plan_key, planner=args.planner, metrics=row, waypoints=waypoints), f)
+        print(f"\nShowing {args.planner} on {args.plan_key} ({query['method']} ({query['x']:.3f}, {query['y']:.3f}) "
+              f"yaw {query['yaw_deg']:.0f}): ee ratio {row['ee_ratio']}, path ratio {row['path_ratio']}.\n"
+              f"RViz (same ROS master): Trajectory display on /planner_benchmark/display_path, Marker on "
+              f"/planner_benchmark/tcp_path. Ctrl-C to quit (removes the crate contents).")
+        rospy.spin()
+    finally:
+        if contents is not None:
+            contents.remove()
+
+
 # --------------------------------------------------------------------------
 # summarize
 # --------------------------------------------------------------------------
@@ -683,6 +763,18 @@ def main():
     r.add_argument('--limit-queries', type=int, default=None)
     r.add_argument('--seed', type=int, default=0, help="Planner order shuffle")
 
+    v = sub.add_parser('show', help="Replan one start/goal pair and show the path in RViz")
+    v.add_argument('--robot-name', default='panda')
+    v.add_argument('--queries', required=True)
+    v.add_argument('--plan-key', required=True, help="plan_key column of a results CSV")
+    v.add_argument('--planner', required=True)
+    v.add_argument('--tries', type=int, default=20, help="Plans tried; the one with the largest ee ratio is shown")
+    v.add_argument('--min-ee-ratio', type=float, default=None, help="Stop at the first plan with at least this ee ratio")
+    v.add_argument('--planning-time', type=float, default=5.0)
+    v.add_argument('--num-planning-attempts', type=int, default=100)
+    v.add_argument('--no-contents', action='store_true')
+    v.add_argument('--save', default=None, help="Write the shown path (waypoints + metrics) to this JSON file")
+
     s = sub.add_parser('summarize', help="Summary table of one or more results CSVs")
     s.add_argument('results', nargs='+')
     s.add_argument('--decide', action='store_true', help="Apply the planner selection rule (see decide())")
@@ -696,6 +788,8 @@ def main():
         cmd_build(args)
     elif args.cmd == 'run':
         cmd_run(args)
+    elif args.cmd == 'show':
+        cmd_show(args)
     else:
         summarize(args.results, args if args.decide else None)
 

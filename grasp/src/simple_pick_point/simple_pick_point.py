@@ -68,6 +68,11 @@ TILT_ANGLES_DEG = [0, 20, -20, 40, -40, 60, -60, 80, -80]
 # Roll around the (post-X-tilt) gripper-closing axis; stays perpendicular to the stem
 Y_TILT_ANGLES_DEG = [0, 20, -20, 40, -40, 60, -60, 80, -80]
 
+# ~grasp_generator (re-read live, so an experiment runner can switch it between attempts):
+#   tilted   straight down, its 180-degree roll, then the tilt table above (our 6/7-DOF)
+#   topdown  straight down or its roll only (Van den Bent's 4-DOF baseline)
+GRASP_GENERATORS = ("tilted", "topdown")
+
 # How many reachable pre-grasp orientations to cycle the arm through for
 # "Test Pre-Grasp Positions", and how long to hold at each one so the
 # gripper's alignment on the truss can actually be seen.
@@ -146,7 +151,21 @@ class SimplePickPoint():
             self.camera_info = msg
             self.rs_intrinsics = camera_info2rs_intrinsics(msg)
 
+    @property
+    def grasp_generator(self):
+        generator = rospy.get_param('~grasp_generator', 'tilted')
+        if generator not in GRASP_GENERATORS:
+            rospy.logwarn(f"~grasp_generator {generator!r} unknown, using 'tilted'")
+            return "tilted"
+        return generator
+
+    def _record_attempt(self, **fields):
+        """Publish what the last pick chose as ~last_attempt (a dict param), for experiment
+        runners: the requested grasp point, the generator, and the orientation it found."""
+        rospy.set_param('~last_attempt', dict(fields, stamp=rospy.get_time()))
+
     def execute_command(self, command, picker="manual"):
+        rospy.set_param('~last_attempt', {})
         grasp_pose = self._capture_and_pick_grasp_pose(picker)
         if grasp_pose is None:
             return "failure"
@@ -367,7 +386,13 @@ class SimplePickPoint():
         see _flip_approach_roll); if that also fails, fall back to other tilt/roll
         combinations (closest to straight-down first) until one clears IK, including the
         pre-grasp offset and the post-grasp back-out/lift (see _check_ik)."""
+        generator = self.grasp_generator
+        p = grasp_pose.pose.position
+        o = grasp_pose.pose.orientation
+        requested = dict(generator=generator, x=p.x, y=p.y, z=p.z,
+                         yaw_deg=float(R.from_quat([o.x, o.y, o.z, o.w]).as_euler('xyz', degrees=True)[2]))
         if self._check_ik(grasp_pose, verbose=True):
+            self._record_attempt(reachable=True, tilt_x_deg=0, tilt_y_deg=0, flip=False, **requested)
             return grasp_pose
 
         self._log_depth_profile(grasp_pose, "straight-down")
@@ -375,9 +400,15 @@ class SimplePickPoint():
         flipped = self._flip_approach_roll(grasp_pose)
         if self._check_ik(flipped):
             print("Found reachable orientation via 180° wrist-roll flip (straight-down)")
+            self._record_attempt(reachable=True, tilt_x_deg=0, tilt_y_deg=0, flip=True, **requested)
             return flipped
 
         self._log_depth_profile(flipped, "180° flip")
+
+        if generator == "topdown":
+            print("Straight-down grasp unreachable; grasp_generator is 'topdown', so no tilts are tried")
+            self._record_attempt(reachable=False, **requested)
+            return None
 
         print("Straight-down grasp unreachable, checking other gripper orientations...")
         tilts = [(deg_x, deg_y) for deg_x in TILT_ANGLES_DEG for deg_y in Y_TILT_ANGLES_DEG
@@ -387,8 +418,10 @@ class SimplePickPoint():
             candidate = self._tilt_pose(grasp_pose, deg_x, deg_y)
             if self._check_ik(candidate):
                 print(f"Found reachable orientation at x_tilt={deg_x}°, y_tilt={deg_y}°")
+                self._record_attempt(reachable=True, tilt_x_deg=deg_x, tilt_y_deg=deg_y, flip=False, **requested)
                 return candidate
 
+        self._record_attempt(reachable=False, **requested)
         return None
 
     def _find_pre_grasp_test_candidates(self, grasp_pose):
