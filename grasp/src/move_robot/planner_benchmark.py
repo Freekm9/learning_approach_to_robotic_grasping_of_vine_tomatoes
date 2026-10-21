@@ -44,6 +44,50 @@ plans the same start -> goal query:
              to the crate walls. --decide applies the selection rule (see decide())
              to the unique plans and tests the others against the chosen planner.
 
+Planner comparison (path quality), added for the thesis' planner chapter:
+  build --points-file  uses real stem grasp points (finger_reachability.py's points file,
+             one crate cloud per scan) instead of the grid; --max-wall-dist-m keeps the
+             wall band only, --sample N a random subset, --forced-tilts adds goals with a
+             fixed tilt (method tilt+DX/+DY) wherever that tilt's pick sequence is feasible.
+  run        planner specs: OMPL config names, 'NAME@SECONDS' for a per-planner time
+             budget (RRTstar@0.5 ...: RRT* uses its whole budget, since OMPL's RRT* only
+             reports its solution when it stops, so MoveIt's ExactSolution/CostConvergence
+             termination conditions never end it early; a budget sweep shows both its time
+             to a usable solution and its path quality against time), 'chomp', 'stomp', 'pilz_ptp' / 'pilz_lin' (straight
+             line in joint / Cartesian space: references, they only succeed when that line
+             is collision-free) and 'pink' (a controller, not a planner: report apart).
+             --no-simplify switches OMPL's path simplification off (dynamic reconfigure)
+             and --num-planning-attempts 1 disables the parallel attempts whose solutions
+             MoveIt hybridises: together they show the raw planner output.
+             Every path is retimed with the pipeline's retimer and scaling (execution time,
+             jerk), measured on a densified joint path (Cartesian TCP path, turning angle,
+             deviation from the straight line, joint reversals, wasted joint motion,
+             clearance to the walls and to the crate contents) and saved, with its timing
+             and TCP path, to paths_<timestamp>.jsonl.gz next to the results CSV.
+  summarize  also reports these metrics and the consistency of the repeats (spread
+             between the TCP paths of repeated plans of the same query).
+
+Return moves (where the robot logged its longest paths: go_to_saved_pose, post-grasp):
+  build --return-moves  adds, per reachable grasp, moves back to the capture pose (the
+             start named 'capture', else the first --start; its joints are the goal, as
+             go_to_saved_pose's joint reset):
+               return_lift        from the lift pose after the grasp (a grasp that failed,
+                                  or a truss that dropped, goes straight back)
+               return_lift_rot    the same lift pose rolled 180 degrees about the approach
+                                  axis (the other roll of the grasp: wrist ~pi away)
+               return_place       from the place pose (with --place-joints), nearest IK to
+                                  go_to_place_above's goal
+               return_place_rot   the place pose rolled 180 degrees about the TCP axis
+                                  (go_to_place_above's allow_flip retry)
+             Planned without the crate contents, as in the pipeline.
+  run --moves M ...     only these moves; --sample-pairs N a random subset of the unique
+             start/goal pairs (--pair-seed), e.g. for a budget sweep over a whole set.
+  run --goal-type pose  plans to the goal POSE (MoveIt samples the IK goal itself, as
+             plan_movement.py did before the nearest-IK goal, ~nearest_ik_goal false)
+             instead of the nearest-IK joint goal; OMPL and Pilz only. path_ratio stays
+             relative to the nearest-IK distance and goal_deviation_rad shows how far the
+             end configuration is from it, so the two goal types compare on the same pairs.
+
 Clearance is measured with Pink's collision model (Franka's *_sc capsules + hand,
 fingers and camera vs. the crate boxes), so it is a consistent relative measure, not
 the exact distance of the collision meshes; the crate contents are not included.
@@ -84,7 +128,28 @@ RESULT_FIELDS = ["query_id", "plan_key", "move", "method", "start_name", "x", "y
                  "planner", "repeat", "success", "error_code", "planning_time_s", "num_waypoints",
                  "joint_path_length", "direct_joint_distance", "path_ratio", "ee_path_length_m",
                  "ee_straight_m", "ee_ratio", "min_clearance_mm", "goal_deviation_rad", "pink_reason",
-                 "contents_columns"]
+                 "contents_columns",
+                 # planner comparison (path quality)
+                 "planner_base", "budget_s", "simplify", "attempts", "planner_time_s", "wall_dist_m", "point_id",
+                 "exec_time_s", "jerk_rms", "joint_turn_rad", "ee_turn_rad", "ee_max_dev_m", "joint_reversals",
+                 "joint_waste_rad", "min_contents_clearance_mm",
+                 # return moves / goal type
+                 "goal_type"]
+# build --return-moves: move -> start_name (all go to the capture pose)
+RETURN_MOVES = {"return_lift": "lift", "return_lift_rot": "lift_rot",
+                "return_place": "place", "return_place_rot": "place_rot"}
+MOVES = ("pre_grasp", "transport") + tuple(RETURN_MOVES)
+# Pipeline's retiming of planned paths (plan_movement.py: 0.3 / 0.3, MoveIt's default
+# iterative parabolic time parameterisation)
+RETIME_VELOCITY_SCALING = 0.3
+RETIME_ACCELERATION_SCALING = 0.3
+DENSIFY_STEP_RAD = 0.01  # joint step for the Cartesian / clearance metrics
+FINAL_APPROACH_EXCLUDED_M = 0.05  # contents clearance ignores the last 5 cm before the goal (fixed by the goal)
+PILZ = {"pilz_ptp": "PTP", "pilz_lin": "LIN"}
+# Franka hand in the hand frame (approximate): body corners and the two fingers, used
+# for the clearance to the crate contents. The fingers start at z 0.0584 and end 1 cm
+# past the TCP; the opening is the pre-grasp opening.
+HAND_BODY_POINTS = [(x, y, z) for x in (-0.03, 0.03) for y in (-0.1, 0.0, 0.1) for z in (0.0, 0.066)]
 
 
 def ws_dir():
@@ -143,11 +208,12 @@ class Bench(object):
                 boxes.append((name,) + box)
         return boxes
 
-    def contents_obstacle(self):
+    def contents_obstacle(self, carve_mode='cylinder'):
         """CrateContentsObstacle with plan_movement.py's default parameters."""
         from common.crate_contents import CrateContentsObstacle, crate_interior_from_boxes
         return CrateContentsObstacle(self.scene, None, self.frame, crate_interior_from_boxes(self.scene_boxes()),
-                                     cell_m=0.02, carve_radius_m=0.04, corridor_length_m=CONTENTS_CORRIDOR_M)
+                                     cell_m=0.02, carve_radius_m=0.04, corridor_length_m=CONTENTS_CORRIDOR_M,
+                                     carve_mode=carve_mode)
 
     def tcp_offset_m(self):
         """hand -> hand_tcp distance of the loaded robot_description (0.1034 + finger extension)."""
@@ -161,6 +227,45 @@ class Bench(object):
         import rospy
         return any(n.startswith(self.ns + '/') and n.endswith(f'/{pipeline}/planning_plugin')
                    for n in rospy.get_param_names())
+
+
+class CloudCache(object):
+    """Crate clouds by path, loaded once (a query file can hold points of several scans)."""
+
+    def __init__(self):
+        self.clouds = {}
+
+    def __call__(self, path):
+        if path not in self.clouds:
+            from pcd_io import load_pcd
+            self.clouds[path] = load_pcd(path)[0]
+        return self.clouds[path]
+
+
+def parse_planner(spec, default_time):
+    """'RRTstarTime@2' -> ('RRTstarTime', 2.0); 'chomp' -> ('chomp', default_time)."""
+    name, _, budget = spec.partition('@')
+    return name, float(budget) if budget else default_time
+
+
+def set_ompl_simplify(bench, value):
+    """Switch OMPL's path simplification in move_group (dynamic reconfigure); returns the
+    previous value."""
+    import rosservice
+    from dynamic_reconfigure.client import Client
+    servers = [s[:-len('/set_parameters')] for s in rosservice.get_service_list()
+               if s.startswith(bench.ns + '/') and s.endswith('/set_parameters') and 'ompl' in s]
+    if not servers:
+        raise SystemExit("No OMPL dynamic reconfigure server in move_group: can't switch path simplification")
+    client = Client(servers[0], timeout=5.0)
+    previous = client.get_configuration(timeout=5.0)['simplify_solutions']
+    client.update_configuration({'simplify_solutions': bool(value)})
+    return previous
+
+
+def wall_distance(x, y, interior):
+    x_lo, x_hi, y_lo, y_hi = interior[:4]
+    return float(min(x - x_lo, x_hi - x, y - y_lo, y_hi - y))
 
 
 def wilson(k, n, z=1.96):
@@ -243,13 +348,29 @@ def cmd_build(args):
 
     rospy.init_node('planner_benchmark_build')
     bench = Bench(args.robot_name)
-    cloud = args.pcd or sorted(glob.glob(os.path.join(ws_dir(), 'experiments', 'full_crate_clouds', '*.pcd')))[-1]
-    xyz, _ = load_pcd(cloud)
     interior = crate_interior_from_boxes(bench.scene_boxes())
-    contents = bench.contents_obstacle()
+    contents = bench.contents_obstacle(args.carve_mode)
     use_contents = not args.no_contents
-    points = grasp_points(xyz, interior, args.spacing_m, args.edge_margin_m, contents.top_crop_z)[:args.limit_points]
-    yaws = np.arange(0, 180, args.yaw_step_deg)
+    clouds = CloudCache()
+    if args.points_file:
+        # Real stem grasp points (finger_reachability.py), each with its own scan's cloud
+        with open(args.points_file) as f:
+            file_points = json.load(f)["points"]
+        points = [dict(x=p["x"], y=p["y"], z=p["z"], cloud=p["cloud"], wall_dist_m=p["wall_dist_m"],
+                       point_id=f'{p["scan"]}:{p["id"]}',
+                       yaws=[(p["yaw_stem_deg"] + o) % 360 for o in args.yaw_offsets])
+                  for p in file_points if args.max_wall_dist_m is None or p["wall_dist_m"] <= args.max_wall_dist_m]
+        if args.sample is not None and args.sample < len(points):
+            points = random.Random(args.seed).sample(points, args.sample)
+        cloud = args.points_file
+    else:
+        cloud = args.pcd or sorted(glob.glob(os.path.join(ws_dir(), 'experiments', 'full_crate_clouds', '*.pcd')))[-1]
+        points = [dict(x=x, y=y, z=z, cloud=os.path.abspath(cloud), wall_dist_m=wall_distance(x, y, interior),
+                       point_id=f'grid{i}', yaws=list(np.arange(0, 180, args.yaw_step_deg)))
+                  for i, (x, y, z) in enumerate(grasp_points(clouds(cloud), interior, args.spacing_m,
+                                                             args.edge_margin_m, contents.top_crop_z))]
+    points = points[:args.limit_points]
+    forced = [tuple(int(v) for v in t.split(':')) for t in args.forced_tilts.split(',')] if args.forced_tilts else []
     starts = ([] if args.no_ready else [("ready", READY_JOINTS)]) + \
         [(s[0], [float(v) for v in s[1:]]) for s in args.start or []]
     if not starts:
@@ -260,16 +381,27 @@ def cmd_build(args):
                                                                          f'{args.robot_name}_hand_tcp')
         place = dict(joints=list(args.place_joints), pose=list(place_pose.translation) +
                      list(R.from_matrix(place_pose.rotation).as_quat()))
+    capture, capture_pose = None, None
+    if args.return_moves:
+        # The return moves end at the capture pose (go_to_saved_pose's joint reset)
+        capture = next((s for s in starts if s[0] == "capture"), starts[0])
+        fk = bench.pink.get_planner(bench.move_group).frame_pose(capture[1], f'{args.robot_name}_hand_tcp')
+        capture_pose = list(fk.translation) + list(R.from_matrix(fk.rotation).as_quat())
+    extra_moves = (["transport"] if place else []) + (list(RETURN_MOVES) if args.return_moves else [])
     tcp = bench.tcp_offset_m()
-    print(f"Cloud {os.path.basename(cloud)}: {len(points)} grasp points x {len(yaws)} yaws x starts "
-          f"{[n for n, _ in starts]}{' + transport' if place else ''}; "
+    print(f"{os.path.basename(cloud)}: {len(points)} grasp points x {len(points[0]['yaws']) if points else 0} yaws "
+          f"x starts {[n for n, _ in starts]}{' + ' + ', '.join(extra_moves) if extra_moves else ''}"
+          f"{f' (return goal: {capture[0]})' if capture else ''}"
+          f"{f', forced tilts {forced}' if forced else ''}; carve {args.carve_mode}; "
           f"hand->TCP {tcp:.4f} m (finger extension {tcp - 0.1034:.3f} m)")
 
     ik = IKChecker(args.robot_name)
     ik_service = rospy.ServiceProxy(f'{bench.ns}/compute_ik', GetPositionIK)
     queries = []
-    for i, (x, y, z) in enumerate(points):
-        for yaw in yaws:
+    for i, point in enumerate(points):
+        x, y, z = point["x"], point["y"], point["z"]
+        xyz = clouds(point["cloud"])
+        for yaw in point["yaws"]:
             base = build_straight_down_pose(x, y, z, float(yaw), bench.frame)
             # Grasp orientation per generator (reachability check without crate contents,
             # as simple_pick_point.py does it)
@@ -285,6 +417,10 @@ def cmd_build(args):
             else:
                 ok, dx, dy, flip = find_reachable_tilt(ik, base)
                 choice["tilted"] = (dx, dy, flip) if ok else None
+            for dx, dy in forced:
+                # A fixed tilt, used wherever its whole pick sequence is feasible: tilted
+                # goals for the planner comparison, also where straight-down would work
+                choice[f"tilt{dx:+d}/{dy:+d}"] = (dx, dy, False) if ik.check_grasp(tilt_pose(base, dx, dy)) else None
 
             def resolve_goals(orientation):
                 """{start_name: goal fields}. Like plan_movement.py's _grasp_orientations, the
@@ -299,7 +435,7 @@ def cmd_build(args):
                 approach = get_approach_vec(grasp.pose)  # the same for both rolls
                 # The goal IK sees the crate contents, as when grasp() plans to pre-grasp
                 if use_contents:
-                    contents.add([x, y, z], approach, xyz=xyz)
+                    contents.add([x, y, z], approach, xyz=xyz, grasp_quat=pose_to_list(grasp)[3:])
                 resolved = {}
                 for start_name, start_joints in starts:
                     best = None
@@ -319,14 +455,17 @@ def cmd_build(args):
                                 nearest_ik(bench, ik_service, offset_pose(pose, approach, PRE_GRASP_OFFSET_M),
                                            start_joints, 3)[0] is not None for pose, _ in candidates):
                             resolved[start_name]["unreachable_reason"] = "goal_in_crate_contents"
-                if place is not None:
+                reached = [r for r in resolved.values() if r.get("reachable")]
+                lift, lift_q = None, None
+                if reached and (place is not None or args.return_moves):
                     # Lift pose after this grasp, near the pre-grasp goal it is reached from
-                    reached = [r for r in resolved.values() if r.get("reachable")]
+                    grasp_used = list_to_pose(reached[0]["grasp_pose"], bench.frame)
+                    _, lift = post_grasp_poses(grasp_used, get_approach_vec(grasp_used.pose))
+                    lift_q, _, _ = nearest_ik(bench, ik_service, lift, reached[0]["goal_joints"], args.ik_seeds)
+                above_q = None
+                if place is not None:
                     transport = dict(unreachable_reason="no_lift_ik" if reached else "no_pre_grasp_goal")
                     if reached:
-                        grasp_used = list_to_pose(reached[0]["grasp_pose"], bench.frame)
-                        _, lift = post_grasp_poses(grasp_used, get_approach_vec(grasp_used.pose))
-                        lift_q, _, _ = nearest_ik(bench, ik_service, lift, reached[0]["goal_joints"], args.ik_seeds)
                         if lift_q is not None:
                             # go_to_place_above: the place pose at the current (lift) height,
                             # planned to the IK solution nearest the current joints
@@ -341,24 +480,64 @@ def cmd_build(args):
                                                  unreachable_reason="", tilt_x_deg=dx, tilt_y_deg=dy,
                                                  flip=reached[0]["flip"], grasp_pose=reached[0]["grasp_pose"])
                     resolved["__transport__"] = transport
+                if args.return_moves:
+                    resolved.update(resolve_returns(reached, lift, lift_q, above_q))
                 return resolved
+
+            def resolve_returns(reached, lift, lift_q, above_q):
+                """{'__return_*__': query fields}: the starts of the moves back to the capture
+                pose (see RETURN_MOVES), each with the capture joints as the goal."""
+                out = {f"__{m}__": dict(unreachable_reason="no_pre_grasp_goal" if not reached else
+                                        "no_lift_ik" if m.startswith("return_lift") else "no_place_ik")
+                       for m in RETURN_MOVES}
+                if not reached:
+                    return out
+                common = dict(goal_joints=list(capture[1]), goal_pose=capture_pose, reachable=True, unreachable_reason="",
+                              tilt_x_deg=reached[0]["tilt_x_deg"], tilt_y_deg=reached[0]["tilt_y_deg"],
+                              flip=reached[0]["flip"], grasp_pose=reached[0]["grasp_pose"])
+                starts_q = {}
+                if lift_q is not None:
+                    starts_q["return_lift"] = lift_q
+                    # The other roll: nearest IK of the rolled lift pose to the lift joints
+                    starts_q["return_lift_rot"] = nearest_ik(bench, ik_service, flip_approach_roll(lift), lift_q,
+                                                             args.ik_seeds)[0]
+                if above_q is not None:
+                    # go_to_place descends straight from above, so the place joints are
+                    # the place pose's IK nearest go_to_place_above's goal
+                    place_pose = list_to_pose(place["pose"], bench.frame)
+                    place_q = nearest_ik(bench, ik_service, place_pose, above_q, args.ik_seeds)[0]
+                    starts_q["return_place"] = place_q
+                    if place_q is not None:
+                        starts_q["return_place_rot"] = nearest_ik(bench, ik_service, flip_approach_roll(place_pose),
+                                                                  place_q, args.ik_seeds)[0]
+                for m, q0 in starts_q.items():
+                    if q0 is None:
+                        out[f"__{m}__"] = dict(unreachable_reason="no_rotated_ik" if m.endswith("_rot") else
+                                               out[f"__{m}__"]["unreachable_reason"])
+                        continue
+                    out[f"__{m}__"] = dict(common, start_joints=list(q0), ik_solutions=1,
+                                           direct_joint_distance=float(np.linalg.norm(np.array(q0) -
+                                                                                      np.array(capture[1]))))
+                return out
 
             # Both generators share the goal when they choose the same orientation
             goals = {}
             for method, orientation in choice.items():
                 if orientation is not None and orientation not in goals:
                     goals[orientation] = resolve_goals(orientation)
-                for start_name, start_joints in starts + ([("lift", None)] if place else []):
-                    move = "transport" if start_name == "lift" else "pre_grasp"
+                for move, start_name, start_joints in [("pre_grasp", n, j) for n, j in starts] + \
+                        [(m, "lift" if m == "transport" else RETURN_MOVES[m], None) for m in extra_moves]:
                     q = dict(id=len(queries), move=move, method=method, start_name=start_name,
                              start_joints=list(start_joints) if start_joints else None,
+                             cloud=point["cloud"], point_id=point["point_id"],
+                             wall_dist_m=round(point["wall_dist_m"], 4),
                              x=round(x, 4), y=round(y, 4), z=round(z, 4), yaw_deg=float(yaw),
                              tilt_x_deg=None, tilt_y_deg=None, flip=None, reachable=False,
                              unreachable_reason="no_orientation",
                              grasp_pose=None, pre_grasp_pose=None, goal_pose=None, goal_joints=None,
                              direct_joint_distance=None, ik_solutions=0)
                     if orientation is not None:
-                        q.update(goals[orientation]["__transport__" if move == "transport" else start_name])
+                        q.update(goals[orientation][start_name if move == "pre_grasp" else f"__{move}__"])
                     queries.append(q)
             print(f"[{i + 1}/{len(points)}] ({x:.3f}, {y:.3f}, {z:.3f}) yaw {yaw:.0f}: " +
                   ", ".join(f"{m}={orientation_label(o)}" for m, o in choice.items()))
@@ -375,8 +554,8 @@ def cmd_build(args):
     with open(out_path, 'w') as f:
         json.dump(dict(meta=meta, queries=queries), f, indent=1)
 
-    for move in ("pre_grasp", "transport"):
-        for method in ("topdown", "tilted"):
+    for move in MOVES:
+        for method in dict.fromkeys(q["method"] for q in queries):
             qs = [q for q in queries if q["method"] == method and q["move"] == move]
             if not qs:
                 continue
@@ -394,13 +573,15 @@ def cmd_build(args):
 # --------------------------------------------------------------------------
 
 def plan_query(bench, planner, query, args):
-    """One planning call. Returns (row fields, waypoints or None)."""
+    """One planning call. planner is a spec (see parse_planner). Returns (row fields,
+    waypoints or None)."""
     from moveit_msgs.msg import RobotState
     from common.grasp_motion import PRE_GRASP_GRIPPER_WIDTH_M
     mg = bench.move_group
-    row = dict(pink_reason="", error_code="")
+    name, budget = parse_planner(planner, args.planning_time)
+    row = dict(pink_reason="", error_code="", planner_base=name, budget_s=budget, planner_time_s="")
     t0 = time.time()
-    if planner == "pink":
+    if name == "pink":
         success, plan = bench.pink.plan(list_to_pose(query.get("goal_pose") or query["pre_grasp_pose"], bench.frame), mg,
                                         start_joint_values=query["start_joints"])
         row["pink_reason"] = bench.pink.last_result.reason
@@ -411,16 +592,24 @@ def plan_query(bench, planner, query, args):
         start.joint_state.name = list(bench.joint_names) + fingers
         start.joint_state.position = list(query["start_joints"]) + [PRE_GRASP_GRIPPER_WIDTH_M / 2] * 2
         mg.set_start_state(start)
-        if planner in JOINT_GOAL_PIPELINES:
-            mg.set_planning_pipeline_id(planner)
+        if name in JOINT_GOAL_PIPELINES:
+            mg.set_planning_pipeline_id(name)
+        elif name in PILZ:
+            mg.set_planning_pipeline_id("pilz_industrial_motion_planner")
+            mg.set_planner_id(PILZ[name])
         else:
             mg.set_planning_pipeline_id("ompl")
-            mg.set_planner_id(planner)
-        mg.set_planning_time(args.planning_time)
+            mg.set_planner_id(name)
+        mg.set_planning_time(budget)
         mg.set_num_planning_attempts(args.num_planning_attempts)
-        mg.set_joint_value_target(dict(zip(bench.joint_names, query["goal_joints"])))
-        success, plan, _, error = mg.plan()
+        if args.goal_type == "pose":
+            # MoveIt samples the IK goal itself (plan_movement.py without the nearest-IK goal)
+            mg.set_pose_target(list_to_pose(query["goal_pose"], bench.frame))
+        else:
+            mg.set_joint_value_target(dict(zip(bench.joint_names, query["goal_joints"])))
+        success, plan, planner_time, error = mg.plan()
         row["error_code"] = error.val
+        row["planner_time_s"] = round(planner_time, 4)
         mg.clear_pose_targets()
     row["planning_time_s"] = round(time.time() - t0, 3)
     row["success"] = bool(success)
@@ -428,91 +617,217 @@ def plan_query(bench, planner, query, args):
     return row, waypoints
 
 
-def path_metrics(bench, waypoints, query):
+def retime(bench, waypoints):
+    """Times and accelerations of the waypoints, retimed as the pipeline retimes paths
+    (same retimer and scaling for every planner, so execution times are comparable)."""
+    from moveit_msgs.msg import RobotState, RobotTrajectory
+    from trajectory_msgs.msg import JointTrajectoryPoint
+    traj = RobotTrajectory()
+    traj.joint_trajectory.joint_names = list(bench.joint_names)
+    traj.joint_trajectory.points = [JointTrajectoryPoint(positions=list(q)) for q in waypoints]
+    ref = RobotState()
+    ref.joint_state.name = list(bench.joint_names)
+    ref.joint_state.position = list(waypoints[0])
+    out = bench.move_group.retime_trajectory(ref, traj, velocity_scaling_factor=RETIME_VELOCITY_SCALING,
+                                             acceleration_scaling_factor=RETIME_ACCELERATION_SCALING)
+    points = out.joint_trajectory.points
+    times = [p.time_from_start.to_sec() for p in points]
+    acc = [list(p.accelerations) if len(p.accelerations) else [0.0] * len(bench.joint_names) for p in points]
+    return times, acc
+
+
+def path_metrics(bench, waypoints, query, contents_columns=None, cell_m=0.02, floor_z=0.0):
+    """Path-quality metrics of one plan (see path_quality.py) and the data to save:
+    (metrics, path record)."""
+    from move_robot import path_quality as pq
     planner = bench.pink.get_planner(bench.move_group)
-    tcp = f'{bench.robot_name}_hand_tcp'
-    ee = np.array([planner.frame_pose(q, tcp).translation for q in waypoints])
+    tcp_frame, hand_frame = f'{bench.robot_name}_hand_tcp', f'{bench.robot_name}_hand'
+    dense = pq.densify(waypoints, DENSIFY_STEP_RAD)
+    tcp_poses = [planner.frame_pose(q, tcp_frame) for q in dense]
+    ee = np.array([p.translation for p in tcp_poses])
     joint_len = joint_path_length(waypoints)
     direct = query["direct_joint_distance"]
-    ee_len = float(np.sum(np.linalg.norm(np.diff(ee, axis=0), axis=1)))
+    ee_len = pq.polyline_length(ee)
     ee_straight = float(np.linalg.norm(ee[-1] - ee[0]))
-    clearance = min((float(np.min(c)) for c in map(planner.clearances, waypoints) if len(c)), default=np.nan)
-    return dict(num_waypoints=len(waypoints), joint_path_length=round(joint_len, 4),
-                path_ratio=round(joint_len / direct, 3) if direct > 1e-6 else "",
-                ee_path_length_m=round(ee_len, 4), ee_straight_m=round(ee_straight, 4),
-                ee_ratio=round(ee_len / ee_straight, 3) if ee_straight > 1e-6 else "",
-                min_clearance_mm=round(clearance * 1000, 1),
-                goal_deviation_rad=round(float(np.linalg.norm(np.array(waypoints[-1]) -
-                                                              np.array(query["goal_joints"]))), 4))
+    clearance = min((float(np.min(c)) for c in map(planner.clearances, dense[::5]) if len(c)), default=np.nan)
+    contents_clearance = np.nan
+    if contents_columns:
+        # Hand body + fingers, from the hand pose; the last few cm before the goal are
+        # left out (there the gripper must enter the carved corridor, whatever the planner)
+        from common.grasp_motion import PRE_GRASP_GRIPPER_WIDTH_M
+        tip_z = bench.tcp + 0.01  # hand -> TCP + 1 cm
+        fingers = [(0.0, s * PRE_GRASP_GRIPPER_WIDTH_M / 2, z) for s in (-1, 1) for z in np.linspace(0.0584, tip_z, 5)]
+        local = np.array(HAND_BODY_POINTS + fingers)
+        far = np.linalg.norm(ee - ee[-1], axis=1) > FINAL_APPROACH_EXCLUDED_M
+        if far.any():
+            cols = np.array(contents_columns)
+            centers = np.stack([cols[:, 0], cols[:, 1], (floor_z + cols[:, 2]) / 2], axis=1)
+            half = np.stack([np.full(len(cols), cell_m / 2), np.full(len(cols), cell_m / 2),
+                             (cols[:, 2] - floor_z) / 2], axis=1)
+            pts = []
+            for q in dense[far][::2]:
+                hand = planner.frame_pose(q, hand_frame)
+                pts.append(local @ np.asarray(hand.rotation).T + hand.translation)
+            contents_clearance = float(np.min(pq.box_distance(np.concatenate(pts), centers, half)))
+    times, acc = retime(bench, waypoints)
+    metrics = dict(num_waypoints=len(waypoints), joint_path_length=round(joint_len, 4),
+                   path_ratio=round(joint_len / direct, 3) if direct > 1e-6 else "",
+                   ee_path_length_m=round(ee_len, 4), ee_straight_m=round(ee_straight, 4),
+                   ee_ratio=round(ee_len / ee_straight, 3) if ee_straight > 1e-6 else "",
+                   min_clearance_mm=round(clearance * 1000, 1),
+                   goal_deviation_rad=round(float(np.linalg.norm(np.array(waypoints[-1]) -
+                                                                 np.array(query["goal_joints"]))), 4),
+                   exec_time_s=round(times[-1], 3) if times else "",
+                   jerk_rms=round(pq.jerk_rms(times, acc), 3),
+                   joint_turn_rad=round(pq.turning_angle(dense), 3),
+                   # at 1 cm spacing, so sub-mm kinks between waypoints don't count as turning
+                   ee_turn_rad=round(pq.turning_angle(pq.resample(ee, max(int(ee_len / 0.01) + 1, 3))), 3),
+                   ee_max_dev_m=round(pq.max_deviation(ee), 4),
+                   joint_reversals=pq.joint_reversals(dense),
+                   joint_waste_rad=round(pq.wasted_joint_motion(dense), 4),
+                   min_contents_clearance_mm=round(contents_clearance * 1000, 1))
+    step = max(len(ee) // 200, 1)
+    record = dict(waypoints=np.round(waypoints, 5).tolist(), t=np.round(times, 4).tolist(),
+                  tcp=np.round(ee[::step], 4).tolist() + ([np.round(ee[-1], 4).tolist()] if (len(ee) - 1) % step else []))
+    return metrics, record
+
+
+def resume_files(results_path, paths_path, plans_per_pair):
+    """For --resume: keep only the start/goal pairs of an interrupted run that have all
+    their plans (planner x repeat) in the results CSV, rewrite the CSV and the paths file
+    without the incomplete pair (and a record cut off by the interruption), and return
+    the plan_keys of the complete pairs."""
+    import pandas as pd
+    d = pd.read_csv(results_path, on_bad_lines='skip')
+    d = d[d["planner"].notna() & d["repeat"].notna()]
+    n = d.drop_duplicates(["plan_key", "planner", "repeat"]).groupby("plan_key").size()
+    complete = set(n[n >= plans_per_pair].index)
+    # reindex: a CSV written before a column was added gets it (empty)
+    d[d["plan_key"].isin(complete)].reindex(columns=RESULT_FIELDS).to_csv(results_path, index=False)
+    records = []
+    if os.path.exists(paths_path):
+        import gzip
+        try:
+            with gzip.open(paths_path, 'rt') as fp:
+                for line in fp:
+                    try:
+                        records.append(json.loads(line))
+                    except ValueError:
+                        pass
+        except (EOFError, OSError):
+            pass  # truncated last member
+        with gzip.open(paths_path, 'wt') as fp:
+            for r in records:
+                if r["plan_key"] in complete:
+                    fp.write(json.dumps(r) + "\n")
+    return complete
 
 
 def plan_key(query):
-    """Stable id of a query's start/goal pair: the same in every run and query file."""
+    """Stable id of a query's start/goal pair: the same in every run and query file. The
+    scan is part of it when the queries come from several scans (other crate contents)."""
     import hashlib
     values = np.round(list(query["start_joints"]) + list(query["goal_joints"]), 4).tolist()
+    if query.get("cloud") and query.get("point_id", "").find(":") > 0:
+        values.append(os.path.basename(query["cloud"]))
     return query["move"] + ":" + hashlib.sha1(json.dumps(values).encode()).hexdigest()[:12]
 
 
 def cmd_run(args):
+    import gzip
     import rospy
     rospy.init_node('planner_benchmark_run')
     with open(args.queries) as f:
         data = json.load(f)
     meta, queries = data["meta"], data["queries"]
-    queries = [q for q in queries if q["reachable"] and q["method"] in args.methods][:args.limit_queries]
+    queries = [q for q in queries if q["reachable"] and (not args.methods or q["method"] in args.methods)
+               and (not args.moves or q.get("move", "pre_grasp") in args.moves)]
+    queries = queries[:args.limit_queries]
+    if args.goal_type == "pose":
+        for p in args.planners:
+            name, _ = parse_planner(p, args.planning_time)
+            if name in JOINT_GOAL_PIPELINES or name == "pink":
+                raise SystemExit(f"--goal-type pose: '{name}' plans to joint goals only (pink always plans to the pose)")
+        if any(not q.get("goal_pose") for q in queries):
+            raise SystemExit("--goal-type pose: some queries have no goal_pose (query file built before it was stored?)")
 
     bench = Bench(args.robot_name)
     if bench.frame != meta["planning_frame"]:
         raise SystemExit(f"Planning frame {bench.frame} != the query file's {meta['planning_frame']}")
     tcp = bench.tcp_offset_m()
+    bench.tcp = tcp
     if abs(tcp - meta["hand_tcp_offset_m"]) > 1e-3:
         raise SystemExit(f"hand->TCP is {tcp:.4f} m but the queries were built with {meta['hand_tcp_offset_m']:.4f} m: "
                          f"launch the sim with the same finger_extension_m/tcp_xyz (or rebuild the queries)")
     for p in args.planners:
-        if p in JOINT_GOAL_PIPELINES and not bench.pipeline_loaded(p):
-            raise SystemExit(f"Pipeline '{p}' is not loaded in move_group (stomp needs stomp:=true and "
+        name, _ = parse_planner(p, args.planning_time)
+        if name in JOINT_GOAL_PIPELINES and not bench.pipeline_loaded(name):
+            raise SystemExit(f"Pipeline '{name}' is not loaded in move_group (stomp needs stomp:=true and "
                              f"/root/stomp_ws sourced)")
+        if name in PILZ and not bench.pipeline_loaded("pilz_industrial_motion_planner"):
+            raise SystemExit("The Pilz pipeline is not loaded in move_group")
 
     contents = None
     if not meta.get("crate_contents", True) and not args.no_contents:
         print("Queries were built without crate contents, so planning without them too")
         args.no_contents = True
     if not args.no_contents:
-        from pcd_io import load_pcd
         from scipy.spatial.transform import Rotation as R
-        contents = bench.contents_obstacle()
-        cloud_xyz, _ = load_pcd(meta["cloud"])
+        carve_mode = meta.get("args", {}).get("carve_mode", "cylinder")
+        contents = bench.contents_obstacle(carve_mode)
+        clouds = CloudCache()
 
-    out_path = os.path.join(os.path.dirname(os.path.abspath(args.queries)),
-                            f"results_{time.strftime('%Y%m%d_%H%M%S')}.csv")
-    # Queries with the same start and goal (both generators chose the same orientation)
-    # are planned once; the rows are written for each of them under one plan_key
+    previous_simplify = set_ompl_simplify(bench, not args.no_simplify)
+    stamp = time.strftime('%Y%m%d_%H%M%S')
+    out_dir = os.path.dirname(os.path.abspath(args.queries))
+    out_path = args.resume or os.path.join(out_dir, f"results_{stamp}.csv")
+    paths_path = os.path.join(os.path.dirname(os.path.abspath(out_path)),
+                              os.path.basename(out_path).replace("results_", "paths_").replace(".csv", ".jsonl.gz"))
+    # Queries with the same start, goal and crate contents (both generators chose the same
+    # orientation) are planned once; the rows are written for each of them under one plan_key
     groups = {}
     for q in queries:
         q.setdefault("move", "pre_grasp")
-        key = (q["move"], tuple(np.round(q["start_joints"], 4)), tuple(np.round(q["goal_joints"], 4)))
+        key = (q["move"], tuple(np.round(q["start_joints"], 4)), tuple(np.round(q["goal_joints"], 4)),
+               q.get("cloud") if q["move"] == "pre_grasp" else None,
+               tuple(np.round(q["grasp_pose"], 4)) if q["move"] == "pre_grasp" and q.get("grasp_pose") else None)
         groups.setdefault(key, []).append(q)
     groups = list(groups.values())
+    if args.sample_pairs is not None and args.sample_pairs < len(groups):
+        # Random subset of the pairs (not the first N queries, which are a few grasp points)
+        groups = random.Random(args.pair_seed).sample(groups, args.sample_pairs)
+    if args.resume:
+        complete = resume_files(out_path, paths_path, len(args.planners) * args.repeats)
+        n_before = len(groups)
+        groups = [g for g in groups if plan_key(g[0]) not in complete]
+        print(f"Resuming {out_path}: {n_before - len(groups)} start/goal pairs already complete, {len(groups)} to go")
+    print(f"writing results: {out_path}")
     rng = random.Random(args.seed)
     n_total = len(groups) * len(args.planners) * args.repeats
     print(f"{len(queries)} queries = {len(groups)} unique start/goal pairs x {len(args.planners)} planners x "
-          f"{args.repeats} repeats = {n_total} plans; crate contents {'off' if contents is None else 'on'}")
+          f"{args.repeats} repeats = {n_total} plans; crate contents {'off' if contents is None else 'on'}; "
+          f"OMPL simplification {'off' if args.no_simplify else 'on'}, {args.num_planning_attempts} attempts")
     done = 0
-    with open(out_path, 'w', newline='') as f:
+    mode = 'a' if args.resume else 'w'
+    with open(out_path, mode, newline='') as f, gzip.open(paths_path, mode + 't') as fp:
         writer = csv.DictWriter(f, fieldnames=RESULT_FIELDS)
-        writer.writeheader()
+        if not args.resume:
+            writer.writeheader()
         try:
             for gi, group in enumerate(groups):
                 query = group[0]
-                n_columns = ""
+                n_columns, columns = "", None
                 if contents is not None:
                     # The crate contents are only in the scene for the move to pre-grasp
                     if query["move"] == "pre_grasp":
                         grasp = query["grasp_pose"]
                         approach = R.from_quat(grasp[3:]).apply([0, 0, 1])
-                        n_columns = contents.add(grasp[:3], approach, xyz=cloud_xyz)
+                        n_columns = contents.add(grasp[:3], approach, xyz=clouds(query.get("cloud") or meta["cloud"]),
+                                                 grasp_quat=grasp[3:])
+                        columns = list(contents.columns)
                     else:
                         contents.remove()
+                key = plan_key(query)
                 results = []
                 for repeat in range(args.repeats):
                     order = list(args.planners)
@@ -521,13 +836,22 @@ def cmd_run(args):
                         if rospy.is_shutdown():
                             return
                         row, waypoints = plan_query(bench, planner, query, args)
-                        row.update(plan_key=plan_key(query), planner=planner, repeat=repeat, contents_columns=n_columns,
-                                   direct_joint_distance=round(query["direct_joint_distance"], 4))
+                        row.update(plan_key=key, planner=planner, repeat=repeat, contents_columns=n_columns,
+                                   direct_joint_distance=round(query["direct_joint_distance"], 4),
+                                   simplify=not args.no_simplify, attempts=args.num_planning_attempts,
+                                   goal_type="pose" if args.goal_type == "pose" or
+                                   parse_planner(planner, 0)[0] == "pink" else "nearest_ik")
                         if waypoints:
-                            row.update(path_metrics(bench, waypoints, query))
+                            metrics, record = path_metrics(bench, waypoints, query, columns,
+                                                           floor_z=contents.floor_z if contents else 0.0)
+                            row.update(metrics)
+                            fp.write(json.dumps(dict(plan_key=key, planner=planner, repeat=repeat,
+                                                     simplify=not args.no_simplify, goal_type=row["goal_type"],
+                                                     attempts=args.num_planning_attempts, **record)) + "\n")
                         for q in group:
-                            row.update({k: q[k] for k in ("move", "method", "start_name", "x", "y", "z", "yaw_deg",
-                                                          "tilt_x_deg", "tilt_y_deg", "flip")}, query_id=q["id"])
+                            row.update({k: q.get(k, "") for k in ("move", "method", "start_name", "x", "y", "z",
+                                                                  "yaw_deg", "tilt_x_deg", "tilt_y_deg", "flip",
+                                                                  "wall_dist_m", "point_id")}, query_id=q["id"])
                             writer.writerow(row)
                         f.flush()
                         results.append((planner, row["success"]))
@@ -538,7 +862,8 @@ def cmd_run(args):
         finally:
             if contents is not None:
                 contents.remove()
-    print(f"\n{done}/{n_total} plans; results: {out_path}\n")
+            set_ompl_simplify(bench, previous_simplify)
+    print(f"\n{done}/{n_total} plans; results: {out_path}\npaths: {paths_path}\n")
     summarize([out_path])
 
 
@@ -578,7 +903,7 @@ def cmd_show(args):
             if not waypoints:
                 print(f"try {i}: failed ({row['error_code'] or row['pink_reason']})")
                 continue
-            row.update(path_metrics(bench, waypoints, query))
+            row.update(path_metrics(bench, waypoints, query)[0])
             print(f"try {i}: path ratio {row['path_ratio']}, ee ratio {row['ee_ratio']}, "
                   f"min clearance {row['min_clearance_mm']} mm, {row['planning_time_s']} s")
             if best is None or (row['ee_ratio'] or 0) > (best[0]['ee_ratio'] or 0):
@@ -641,26 +966,78 @@ def load_results(paths):
     return d
 
 
+def load_paths(results_paths):
+    """Saved paths (paths_<stamp>.jsonl.gz next to each results_<stamp>.csv), as a list of
+    dicts with 'run' set to the results file name."""
+    import gzip
+    records = []
+    for path in results_paths:
+        p = os.path.join(os.path.dirname(os.path.abspath(path)),
+                         os.path.basename(path).replace("results_", "paths_").replace(".csv", ".jsonl.gz"))
+        if not os.path.exists(p):
+            continue
+        with gzip.open(p, 'rt') as f:
+            for line in f:
+                r = json.loads(line)
+                r["run"] = os.path.basename(path)
+                records.append(r)
+    return records
+
+
+def consistency(results_paths):
+    """Per (run, plan_key, planner): spread between the repeats' TCP paths (mm) and joint
+    paths (rad), see path_quality.path_spread. Empty if no paths were saved."""
+    import pandas as pd
+    from move_robot import path_quality as pq
+    by_query = {}
+    for r in load_paths(results_paths):
+        by_query.setdefault((r["run"], r["plan_key"], r["planner"]), []).append(r)
+    rows = []
+    for (run, key, planner), rs in by_query.items():
+        if len(rs) > 1:
+            rows.append(dict(run=run, plan_key=key, planner=planner,
+                             ee_spread_mm=pq.path_spread([r["tcp"] for r in rs]) * 1000,
+                             joint_spread_rad=pq.path_spread([r["waypoints"] for r in rs])))
+    return pd.DataFrame(rows)
+
+
 def summarize(paths, decide_args=None):
     import pandas as pd
     d = load_results(paths)
+    for col, default in (("simplify", True), ("attempts", ""), ("planner_time_s", np.nan)):
+        if col not in d:
+            d[col] = default
+    d["variant"] = np.where(d["simplify"].astype(str).str.lower() == "false", "raw", "simplified")
+    spread = consistency(paths)
     rows = []
-    for (move, method, planner), g in d.groupby(["move", "method", "planner"]):
-        ok = g[g["success"]]
-        lo, hi = wilson(int(g["success"].sum()), len(g))
-        rows.append(dict(
-            move=move, method=method, planner=planner, plans=len(g), queries=g["query_id"].nunique(),
-            success=f"{g['success'].mean() * 100:.1f}% [{lo * 100:.0f}-{hi * 100:.0f}]",
-            t_med_s=ok["planning_time_s"].median(), t_p95_s=ok["planning_time_s"].quantile(0.95),
-            ratio_med=ok["path_ratio"].median(), ratio_p95=ok["path_ratio"].quantile(0.95),
-            ee_len_med_m=ok["ee_path_length_m"].median(), ee_ratio_med=ok["ee_ratio"].median(),
-            clear_med_mm=ok["min_clearance_mm"].median(), clear_min_mm=ok["min_clearance_mm"].min(),
-            goal_dev_max=ok["goal_deviation_rad"].max()))
-    with pd.option_context('display.width', 250, 'display.max_columns', 30, 'display.float_format', '{:.3f}'.format):
+    for (move, variant, planner), g in d.groupby(["move", "variant", "planner"]):
+        u = g.drop_duplicates(["run", "plan_key", "repeat"])  # a pair shared by both generators counts once
+        ok = u[u["success"]]
+        lo, hi = wilson(int(u["success"].sum()), len(u))
+        row = dict(move=move, variant=variant, planner=planner, plans=len(u),
+                   success=f"{u['success'].mean() * 100:.1f}% [{lo * 100:.0f}-{hi * 100:.0f}]",
+                   t_med_s=ok["planning_time_s"].median(), t_p95_s=ok["planning_time_s"].quantile(0.95),
+                   ratio_med=ok["path_ratio"].median(), ratio_p95=ok["path_ratio"].quantile(0.95),
+                   ee_ratio_med=ok["ee_ratio"].median(), ee_ratio_p95=ok["ee_ratio"].quantile(0.95),
+                   clear_min_mm=ok["min_clearance_mm"].min())
+        if "exec_time_s" in ok:
+            row.update(exec_med_s=ok["exec_time_s"].median(), ee_dev_p95_mm=ok["ee_max_dev_m"].quantile(0.95) * 1000,
+                       ee_turn_med=ok["ee_turn_rad"].median(), jturn_med=ok["joint_turn_rad"].median(),
+                       reversals_mean=ok["joint_reversals"].mean(), waste_p95=ok["joint_waste_rad"].quantile(0.95),
+                       jerk_med=ok["jerk_rms"].median(), contents_clear_med_mm=ok["min_contents_clearance_mm"].median())
+        if len(spread):
+            sp = spread[(spread["planner"] == planner) & spread["plan_key"].isin(u["plan_key"]) &
+                        spread["run"].isin(u["run"])]
+            row.update(spread_med_mm=sp["ee_spread_mm"].median(), spread_p95_mm=sp["ee_spread_mm"].quantile(0.95))
+        rows.append(row)
+    with pd.option_context('display.width', 300, 'display.max_columns', 40, 'display.float_format', '{:.3f}'.format):
         print(pd.DataFrame(rows).to_string(index=False))
-    print("\nsuccess: per plan, Wilson 95% CI. Times/lengths over successful plans. ratio = joint path / direct "
-          "joint distance to the fixed goal; ee_ratio = TCP path / straight TCP distance; clearance to the crate "
-          "walls (Pink capsules). goal_dev = joint distance of the end configuration from the fixed goal (Pink).")
+    print("\nsuccess: per unique plan, Wilson 95% CI. Other columns over successful plans. ratio = joint path / "
+          "direct joint distance to the fixed goal; ee_ratio = TCP path / straight TCP distance; clear = wall "
+          "clearance (Pink capsules); exec = execution time after the pipeline's retiming; ee_dev = TCP deviation "
+          "from the straight line; turn = total turning angle (rad); reversals = joint direction reversals; waste = "
+          "joint travel beyond the net motion (rad); contents_clear = hand/fingers to the crate contents, last 5 cm "
+          "excluded; spread = mean distance between the TCP paths of the repeats of a query.")
     if decide_args is not None:
         print()
         decide(d, decide_args)
@@ -749,19 +1126,44 @@ def main():
     b.add_argument('--limit-points', type=int, default=None, help="Only the first N grasp points (smoke test)")
     b.add_argument('--no-contents', action='store_true',
                    help="Resolve the goals without the crate-contents height map (run then plans without it too)")
+    b.add_argument('--carve-mode', choices=['cylinder', 'gripper'], default='cylinder',
+                   help="Crate-contents carve around the approach (the robot uses gripper since E4)")
+    b.add_argument('--points-file', default=None,
+                   help="Real stem grasp points (finger_reachability.py points_*.json) instead of the grid")
+    b.add_argument('--yaw-offsets', type=float, nargs='+', default=[0.0],
+                   help="With --points-file: yaw offsets (deg) from each point's stem-perpendicular yaw")
+    b.add_argument('--max-wall-dist-m', type=float, default=None, help="With --points-file: wall band only")
+    b.add_argument('--sample', type=int, default=None, help="With --points-file: random subset of N points")
+    b.add_argument('--seed', type=int, default=0, help="--sample seed")
+    b.add_argument('--return-moves', action='store_true',
+                   help="Add the moves back to the capture pose (return_lift, return_place, rolled starts)")
+    b.add_argument('--forced-tilts', default=None, metavar='DX:DY,...',
+                   help="Extra goals with these fixed tilts (deg, as the tilt table) where feasible, e.g. 40:0,-40:0")
 
     r = sub.add_parser('run', help="Plan every query with every planner")
     r.add_argument('--robot-name', default='panda')
     r.add_argument('--queries', required=True)
     r.add_argument('--planners', nargs='+', default=['RRTConnect', 'BiTRRT', 'RRTstar', 'chomp'],
-                   help="OMPL planner names, 'chomp', 'stomp', 'pink'")
-    r.add_argument('--methods', nargs='+', default=['topdown', 'tilted'], choices=['topdown', 'tilted'])
+                   help="OMPL planner config names, 'chomp', 'stomp', 'pilz_ptp', 'pilz_lin', 'pink'; "
+                        "NAME@SECONDS sets that planner's time budget")
+    r.add_argument('--methods', nargs='+', default=None,
+                   help="Goal sets to plan (topdown, tilted, tilt+DX/+DY); default all")
+    r.add_argument('--no-simplify', action='store_true',
+                   help="Switch OMPL's path simplification off for this run (raw planner output)")
     r.add_argument('--repeats', type=int, default=5)
     r.add_argument('--planning-time', type=float, default=5.0, help="as plan_movement.py")
     r.add_argument('--num-planning-attempts', type=int, default=100, help="as plan_movement.py")
     r.add_argument('--no-contents', action='store_true', help="Crate walls only, no crate-contents height map")
     r.add_argument('--limit-queries', type=int, default=None)
+    r.add_argument('--moves', nargs='+', default=None, choices=MOVES, help="Only queries of these moves")
+    r.add_argument('--goal-type', choices=['joint', 'pose'], default='joint',
+                   help="joint: the fixed nearest-IK goal (default); pose: the goal pose, IK sampled by MoveIt")
+    r.add_argument('--sample-pairs', type=int, default=None, help="Random subset of N unique start/goal pairs")
+    r.add_argument('--pair-seed', type=int, default=0, help="--sample-pairs seed")
     r.add_argument('--seed', type=int, default=0, help="Planner order shuffle")
+    r.add_argument('--resume', default=None, metavar='RESULTS_CSV',
+                   help="Continue an interrupted run: keep its complete start/goal pairs, plan the rest into "
+                        "the same results/paths files (same --planners/--repeats/--methods as the first run)")
 
     v = sub.add_parser('show', help="Replan one start/goal pair and show the path in RViz")
     v.add_argument('--robot-name', default='panda')

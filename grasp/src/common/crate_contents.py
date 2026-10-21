@@ -196,6 +196,7 @@ class CrateContentsObstacle(object):
         # beside it (TCP x)
         self.gripper_half_x_m = gripper_half_x_m
         self.gripper_half_y_m = gripper_half_y_m
+        self.columns = []
 
     def _lookup(self, target, source, stamp):
         tf = self.tf_buffer.lookup_transform(target, source, stamp, rospy.Duration(1.0))
@@ -241,6 +242,7 @@ class CrateContentsObstacle(object):
             else:
                 columns = carve_gripper_box(columns, self.floor_z, self.cell_m, grasp_xyz, R.from_quat(grasp_quat),
                                             self.gripper_half_x_m, self.gripper_half_y_m, self.corridor_length_m)
+        self.columns = columns  # (cx, cy, top) of the added boxes, e.g. for clearance metrics
         if not columns:
             rospy.logwarn("Crate contents: no columns left to add (empty cloud/crate?)")
             return 0
@@ -254,6 +256,7 @@ class CrateContentsObstacle(object):
         if CRATE_CONTENTS_ID in self.scene.get_known_object_names():
             self.scene.remove_world_object(CRATE_CONTENTS_ID)
             self._wait_for(present=False)
+        self.columns = []
 
     def _wait_for(self, present, timeout_s=3.0):
         deadline = time.time() + timeout_s
