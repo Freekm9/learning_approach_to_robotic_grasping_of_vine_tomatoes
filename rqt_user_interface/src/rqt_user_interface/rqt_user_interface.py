@@ -5,9 +5,24 @@ import rospkg
 
 from qt_gui.plugin import Plugin
 from python_qt_binding import loadUi
+from python_qt_binding.QtCore import QTimer
 from python_qt_binding.QtWidgets import QWidget
 from std_msgs.msg import String
 from grasp.srv import pipeline_command, pipeline_commandResponse
+
+# Planners the showcase can cycle through: (label, pipeline_id, planner_id). plan_movement
+# re-reads ~pipeline_id/~planner_id before every move, so a switch applies from the next move.
+# planner_id is only used by ompl and Pilz; chomp has a single fixed algorithm.
+PLANNERS = [
+    ("RRT-Connect", "ompl", "RRTConnect"),
+    ("BiTRRT", "ompl", "BiTRRT"),
+    ("RRT* (uses full planning time)", "ompl", "RRTstar"),
+    ("CHOMP", "chomp", None),
+    ("Pilz PTP (joint line)", "pilz_industrial_motion_planner", "PTP"),
+    ("Pilz LIN (Cartesian line)", "pilz_industrial_motion_planner", "LIN"),
+]
+# Relative to the GUI's namespace (/<robot_name>), like the rqt_service calls
+PLAN_MOVEMENT_NS = 'plan_movement/'
 
 class RqtPipeline(Plugin):
 
@@ -77,6 +92,55 @@ class RqtPipeline(Plugin):
         self.simple_pick_point_service = None
         self.test_pre_grasp_positions_service = None
         self.simple_pick_point_services = {}
+
+        # Planner switch for showing the planners on the robot
+        for label, _, _ in PLANNERS:
+            self._widget.PlannerSelect.addItem(label)
+        current = self.active_planner_index()
+        if current is not None:
+            self._widget.PlannerSelect.setCurrentIndex(current)
+        self._widget.PlannerSelect.activated[int].connect(lambda index: self.select_planner(index))
+        self._widget.NextPlanner.clicked[bool].connect(
+            lambda: self.select_planner((self._widget.PlannerSelect.currentIndex() + 1) % len(PLANNERS)))
+        # Show what plan_movement will actually use, also when it is changed elsewhere (rosparam set)
+        self.planner_status_timer = QTimer()
+        self.planner_status_timer.timeout.connect(self.update_planner_status)
+        self.planner_status_timer.start(1000)
+        self.update_planner_status()
+
+    def active_planner_index(self):
+        # plan_movement's defaults when the params are unset: ompl / BiTRRT
+        pipeline = rospy.get_param(PLAN_MOVEMENT_NS + 'pipeline_id', 'ompl')
+        planner = rospy.get_param(PLAN_MOVEMENT_NS + 'planner_id', 'BiTRRT')
+        for i, (_, p, pl) in enumerate(PLANNERS):
+            if p == pipeline and (pl is None or pl == planner):
+                return i
+        return None
+
+    def select_planner(self, index):
+        label, pipeline, planner = PLANNERS[index]
+        if not rospy.has_param('/' + rospy.get_namespace().strip('/') + '/move_group/planning_pipelines/' + pipeline):
+            rospy.logwarn(f"Planning pipeline '{pipeline}' is not loaded in move_group; planning with {label} will fail")
+        rospy.set_param(PLAN_MOVEMENT_NS + 'pipeline_id', pipeline)
+        if planner is not None:
+            rospy.set_param(PLAN_MOVEMENT_NS + 'planner_id', planner)
+        # Luuk's and the waypoint motion don't use the selected planner for the pre-grasp
+        rospy.set_param(PLAN_MOVEMENT_NS + 'motion_method', 'ours')
+        rospy.loginfo(f"Planner set to {label} (pipeline_id={pipeline}, planner_id={planner})")
+        self._widget.PlannerSelect.setCurrentIndex(index)
+        self.update_planner_status()
+
+    def update_planner_status(self):
+        index = self.active_planner_index()
+        if index is None:
+            text = "Active: {} / {}".format(rospy.get_param(PLAN_MOVEMENT_NS + 'pipeline_id', 'ompl'),
+                                            rospy.get_param(PLAN_MOVEMENT_NS + 'planner_id', 'BiTRRT'))
+        else:
+            text = "Active: " + PLANNERS[index][0]
+        method = rospy.get_param(PLAN_MOVEMENT_NS + 'motion_method', 'ours')
+        if method != 'ours':
+            text += f" (motion_method {method})"
+        self._widget.PlannerStatus.setText(text)
 
     def trigger_simple_pick_point(self):
         # Bypasses the pipeline/smach dispatch: this service does the whole

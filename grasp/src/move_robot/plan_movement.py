@@ -488,6 +488,9 @@ class Planner(object):
                 # length) over the allotted time instead of stopping at the first
                 # solution like RRTConnect does
                 move_group.set_planner_id(self.planner_id)
+            elif self.pipeline_id == "pilz_industrial_motion_planner":
+                # Pilz needs its own planner name: PTP (joint line) or LIN (Cartesian line)
+                move_group.set_planner_id(self.planner_id if self.planner_id in ("PTP", "LIN") else "PTP")
             # chomp (config/chomp_planning.yaml) has one fixed algorithm and no
             # named planner_id to select -- leave move_group's planner_id alone
             # there so it doesn't carry over a stale ompl planner name.
