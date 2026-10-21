@@ -191,6 +191,9 @@ def cmd_run(args):
                 break
 
             configure(args.robot_name, method, args)
+            # Labels every move plan_movement logs to experiments/trajectories (replay_trajectory.py)
+            rospy.set_param(f"{ns}/plan_movement/trajectory_log_tag",
+                            f"e4 run {run['run_id']} attempt {attempt + 1}")
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             pick_result = pick("grasp").success
             info = rospy.get_param(f"{ns}/simple_pick_point/last_attempt", {}) or {}
@@ -217,6 +220,7 @@ def cmd_run(args):
             move_robot("go_to_saved_pose")
     except KeyboardInterrupt:
         stop_reason = "aborted"
+    rospy.set_param(f"{ns}/plan_movement/trajectory_log_tag", "")  # later moves aren't part of this run
     if stop_reason == "aborted" and input("Run aborted: still record it in runs.csv? [y/N] ").strip().lower() != 'y':
         print("Not recorded; its attempts stay in attempts.csv. Rerun it with --run-id.")
         return

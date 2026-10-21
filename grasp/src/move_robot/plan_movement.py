@@ -28,6 +28,7 @@ from common.moveit_util import all_close, create_collision_object
 from common.util import flip_z_rotation_stamped_pose
 from common.grasp_motion import post_grasp_poses, PRE_GRASP_GRIPPER_WIDTH_M
 from common.crate_contents import CrateContentsObstacle, crate_interior_from_boxes, CRATE_CONTENTS_ID
+from common.trajectory_log import TrajectoryLog
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -156,6 +157,10 @@ class Planner(object):
         ]
         self._init_metrics_csv()
         rospy.loginfo(f"Logging planning metrics to {self.metrics_csv_path}")
+        # Every executed trajectory (planned, executed joint states, crate contents), for
+        # inspection and replay with replay_trajectory.py; see common/trajectory_log.py
+        self.traj_log = TrajectoryLog(os.path.join(catkin_ws_dir, "experiments", "trajectories"),
+                                      enabled=rospy.get_param('~log_trajectories', True))
 
         # Video recording of BOTH a tripod-mounted documentation camera ("side", a
         # RealSense D435) and the gripper-mounted camera ("gripper", the D405 also
@@ -560,7 +565,9 @@ class Planner(object):
                     return 'failure'
             elif success:
                 exec_start = time.time()
-                plan_executed = move_group.execute(plan, wait=True)
+                with self.traj_log.recording(movement, "planned", plan=plan, **self._traj_info()) as rec:
+                    plan_executed = move_group.execute(plan, wait=True)
+                    rec["success"] = plan_executed
                 metrics["execution_duration_s"] = time.time() - exec_start
                 metrics["execution_success"] = plan_executed
                 move_group.stop()
@@ -572,7 +579,7 @@ class Planner(object):
 
             if goal_pose == self.saved_pose_ee: #Also reset joints when going to saved pose
                 move_group.set_planner_id("PTP")
-                move_group.go(self.saved_joints_ee, wait=True)
+                self._go_logged(move_group, self.saved_joints_ee, movement)
                 move_group.stop()
                 move_group.clear_pose_targets()
                 rospy.sleep(1) #sleep for camera to refocus etc
@@ -589,6 +596,16 @@ class Planner(object):
             self._video_call_depth -= 1
             if self._video_call_depth == 0:
                 self._stop_recording()
+
+    def _traj_info(self):
+        return dict(planner=self.planner_label, pipeline=self.pipeline_id, video=self._active_clip_name or "")
+
+    def _go_logged(self, move_group, joints, movement):
+        """move_group.go(joints), with the target and the executed joint states logged."""
+        with self.traj_log.recording(movement, "go", target=dict(zip(move_group.get_active_joints(), joints)),
+                                     **self._traj_info()) as rec:
+            rec["success"] = move_group.go(joints, wait=True)
+        return rec.get("success")
 
     def _new_metrics_row(self, movement, is_retry):
         metrics = {field: "" for field in self._metrics_fields}
@@ -766,7 +783,7 @@ class Planner(object):
     # move end effector straight to goal pose using cartesian path planning,
     # rather than joint-space (OMPL) planning, for a smooth linear approach
     def go_to_pose_cartesian(self, goal_pose, move_group, eef_step=0.005,
-                             velocity_scaling=0.15, acceleration_scaling=0.3):
+                             velocity_scaling=0.15, acceleration_scaling=0.3, movement="go_to_pose_cartesian"):
         if goal_pose == None:
             return 'failure'
 
@@ -781,7 +798,9 @@ class Planner(object):
         # so it must be retimed before execution or the controller rejects it
         plan = self._retime(move_group, plan, velocity_scaling, acceleration_scaling)
 
-        plan_executed = move_group.execute(plan, wait=True)
+        with self.traj_log.recording(movement, "cartesian", plan=plan, **self._traj_info()) as rec:
+            plan_executed = move_group.execute(plan, wait=True)
+            rec["success"] = plan_executed
         move_group.stop()
         move_group.clear_pose_targets()
         if not plan_executed:
@@ -940,6 +959,9 @@ class Planner(object):
                 p, o = grasp_pose.pose.position, grasp_pose.pose.orientation
                 added = obstacle.add([p.x, p.y, p.z], approach_vec, xyz=contents_xyz,
                                      grasp_quat=[o.x, o.y, o.z, o.w]) > 0
+                if added:
+                    self.traj_log.scene = dict(columns=[[round(v, 4) for v in c] for c in obstacle.columns],
+                                               floor_z=obstacle.floor_z, cell_m=obstacle.cell_m)
             except Exception as e:
                 rospy.logwarn(f"Crate contents: could not add obstacle ({e}); planning without it")
         try:
@@ -954,6 +976,7 @@ class Planner(object):
                     return "success", option
             return "failure", None
         finally:
+            self.traj_log.scene = None
             if added:
                 obstacle.remove()
 
@@ -1055,7 +1078,9 @@ class Planner(object):
             metrics["num_waypoints"] = len(plan.joint_trajectory.points)
             plan = self._retime(move_group, plan, velocity_scaling, acceleration_scaling)
             exec_start = time.time()
-            executed = move_group.execute(plan, wait=True)
+            with self.traj_log.recording(movement, "cartesian", plan=plan, **self._traj_info()) as rec:
+                executed = move_group.execute(plan, wait=True)
+                rec["success"] = executed
             metrics["execution_duration_s"] = time.time() - exec_start
             metrics["execution_success"] = executed
             move_group.stop()
@@ -1095,7 +1120,8 @@ class Planner(object):
                     # Slow final descent onto the truss (pre-grasp -> grasp)
                     if self.go_to_pose_cartesian(goal_pose=grasp_pose, move_group=self.move_group_ee,
                                                  velocity_scaling=GRASP_DESCENT_VELOCITY_SCALING,
-                                                 acceleration_scaling=GRASP_DESCENT_ACCELERATION_SCALING) == "success":
+                                                 acceleration_scaling=GRASP_DESCENT_ACCELERATION_SCALING,
+                                                 movement="grasp_descent") == "success":
                         if self.close_gripper(save=True) == "success":
                             # Back out along the approach axis to free the truss from its
                             # neighbours, then lift it straight up, keeping the grasp orientation
@@ -1103,7 +1129,8 @@ class Planner(object):
                             for label, target in (("back-out", backout_pose), ("lift", post_grasp_pose)):
                                 if self.go_to_pose_cartesian(goal_pose=target, move_group=self.move_group_ee,
                                                              velocity_scaling=POST_GRASP_LIFT_VELOCITY_SCALING,
-                                                             acceleration_scaling=POST_GRASP_LIFT_ACCELERATION_SCALING) != "success":
+                                                             acceleration_scaling=POST_GRASP_LIFT_ACCELERATION_SCALING,
+                                                             movement=f"grasp_{label}") != "success":
                                     break
                             else:
                                 return "success"
@@ -1135,9 +1162,10 @@ class Planner(object):
                 return self._go_to_pose_luuk(self.saved_pose_ee, self.move_group_ee, movement='go_to_saved_pose')
             if self.go_to_pose_cartesian(goal_pose=self.saved_pose_ee, move_group=self.move_group_ee,
                                          velocity_scaling=SAVED_POSE_CARTESIAN_VELOCITY_SCALING,
-                                         acceleration_scaling=SAVED_POSE_CARTESIAN_ACCELERATION_SCALING) == "success":
+                                         acceleration_scaling=SAVED_POSE_CARTESIAN_ACCELERATION_SCALING,
+                                         movement="go_to_saved_pose") == "success":
                 # Same joint reset go_to_pose() does, so the camera view is identical each time
-                self.move_group_ee.go(self.saved_joints_ee, wait=True)
+                self._go_logged(self.move_group_ee, self.saved_joints_ee, "go_to_saved_pose")
                 self.move_group_ee.stop()
                 self.move_group_ee.clear_pose_targets()
                 rospy.sleep(1)  # sleep for camera to refocus etc
@@ -1159,7 +1187,8 @@ class Planner(object):
         goal, move_group, allow_flip = self.find_goal_pose(movement=movement)
         if self.go_to_pose_cartesian(goal_pose=goal, move_group=move_group,
                                      velocity_scaling=DROP_OFF_CARTESIAN_VELOCITY_SCALING,
-                                     acceleration_scaling=DROP_OFF_CARTESIAN_ACCELERATION_SCALING) == "success":
+                                     acceleration_scaling=DROP_OFF_CARTESIAN_ACCELERATION_SCALING,
+                                     movement=movement) == "success":
             return "success"
         print(f"Cartesian {movement} failed, falling back to the planner")
         return self.go_to_pose(goal, move_group, allow_flip=allow_flip, movement=movement)
@@ -1263,7 +1292,9 @@ class Planner(object):
                     return 'failure'
                 elif success:
                     exec_start = time.time()
-                    plan_executed = move_group.execute(plan, wait=True)
+                    with self.traj_log.recording(movement, "planned", plan=plan, **self._traj_info()) as rec:
+                        plan_executed = move_group.execute(plan, wait=True)
+                        rec["success"] = plan_executed
                     metrics["execution_duration_s"] = time.time() - exec_start
                     metrics["execution_success"] = plan_executed
                     move_group.stop()
@@ -1297,7 +1328,7 @@ class Planner(object):
 
             if goal_pose == self.saved_pose_ee:  # Also reset joints when going to saved pose
                 move_group.set_planner_id("PTP")
-                move_group.go(self.saved_joints_ee, wait=True)
+                self._go_logged(move_group, self.saved_joints_ee, movement)
                 move_group.stop()
                 move_group.clear_pose_targets()
                 rospy.sleep(1)  # sleep for camera to refocus etc
@@ -1350,21 +1381,25 @@ class Planner(object):
             print("MoveIt execute_trajectory action not available")
             return False, plan
         force_at_start = self.force_z
-        self.execute_trajectory_client.send_goal(moveit_msgs.msg.ExecuteTrajectoryGoal(trajectory=plan))
-        rate = rospy.Rate(20)
-        while not rospy.is_shutdown():
-            if self.execute_trajectory_client.wait_for_result(rospy.Duration(0.001)):
-                result = self.execute_trajectory_client.get_result()
-                return result is not None and result.error_code.val == moveit_msgs.msg.MoveItErrorCodes.SUCCESS, plan
-            if (force_at_start is not None and self.force_z is not None
-                    and self.force_z - force_at_start > self.force_limit):
-                self.execute_trajectory_client.cancel_goal()
-                self.execute_trajectory_client.wait_for_result(rospy.Duration(2))
-                print("CONTACT DETECTED, STOPPING THE STRAIGHT LINE")
-                return True, plan
-            rate.sleep()
-        self.execute_trajectory_client.cancel_goal()
-        return False, plan
+        with self.traj_log.recording("luuk_straight_line", "cartesian", plan=plan, **self._traj_info()) as rec:
+            self.execute_trajectory_client.send_goal(moveit_msgs.msg.ExecuteTrajectoryGoal(trajectory=plan))
+            rate = rospy.Rate(20)
+            while not rospy.is_shutdown():
+                if self.execute_trajectory_client.wait_for_result(rospy.Duration(0.001)):
+                    result = self.execute_trajectory_client.get_result()
+                    rec["success"] = result is not None and result.error_code.val == moveit_msgs.msg.MoveItErrorCodes.SUCCESS
+                    return rec["success"], plan
+                if (force_at_start is not None and self.force_z is not None
+                        and self.force_z - force_at_start > self.force_limit):
+                    self.execute_trajectory_client.cancel_goal()
+                    self.execute_trajectory_client.wait_for_result(rospy.Duration(2))
+                    print("CONTACT DETECTED, STOPPING THE STRAIGHT LINE")
+                    rec["success"], rec["stopped_on_contact"] = True, True
+                    return True, plan
+                rate.sleep()
+            self.execute_trajectory_client.cancel_goal()
+            rec["success"] = False
+            return False, plan
 
     def open_gripper(self):
         rospy.sleep(0.5)
